@@ -1,126 +1,156 @@
 # -*- coding: utf-8 -*-
-#
-# Burp Suite (Jython) extension: view WCF Binary SOAP (application/soap+msbin1)
-# request/response bodies as decoded XML.
-#
-# Engine: shells out to NBFS.exe (built from GDSSecurity/WCF-Binary-SOAP-Plug-In's
-# NBFS.cs). This is read-only: it decodes for viewing. Editing/re-encoding to send
-# modified messages is a separate problem (see notes at bottom).
-#
-# Setup:
-#   1. Build NBFS.exe:  csc /target:exe /out:NBFS.exe NBFS.cs
-#   2. Set NBFS_EXE below to its full path.
-#   3. Burp -> Extensions -> Add -> Extension type: Python -> select this file.
-#      (Jython standalone JAR must be configured in Burp's Python environment.)
+# Burp (Jython): decode WCF msbin1 via a RIGHT-CLICK menu + popup window,
+# not a message-editor tab. Uses NBFS.exe through Java ProcessBuilder.
 
-from burp import IBurpExtender, IMessageEditorTabFactory, IMessageEditorTab
-from java.util import Arrays
-import subprocess
-import base64
+from burp import IBurpExtender, IContextMenuFactory, ITab
+from javax.swing import (JMenuItem, JScrollPane, JTextArea, JFrame,
+                         SwingUtilities, JPanel)
+from java.awt import BorderLayout, Font, Dimension
+from java.util import ArrayList, Arrays
+from java.lang import ProcessBuilder, String as JString, Runnable
+from java.io import BufferedReader, InputStreamReader
 import os
+import traceback
 
-# ---- Configure this ---------------------------------------------------------
 NBFS_EXE = r"C:\tools\wcf\NBFS.exe"
-# -----------------------------------------------------------------------------
 
 
-class BurpExtender(IBurpExtender, IMessageEditorTabFactory):
+class BurpExtender(IBurpExtender, IContextMenuFactory, ITab):
 
     def registerExtenderCallbacks(self, callbacks):
         self._callbacks = callbacks
         self._helpers = callbacks.getHelpers()
-        self._stdout = callbacks.getStdout()
-        callbacks.setExtensionName("NBFS (msbin1) Decoder")
-        callbacks.registerMessageEditorTabFactory(self)
-        if not os.path.isfile(NBFS_EXE):
-            self._log("WARNING: NBFS_EXE not found at %s -- decoding will fail." % NBFS_EXE)
-        else:
-            self._log("NBFS decoder ready (%s)" % NBFS_EXE)
+        self._inv = None
+        callbacks.setExtensionName("NBFS msbin1 (menu)")
+        callbacks.registerContextMenuFactory(self)
+        # top-level "NBFS" tab that accumulates results
+        self._area = JTextArea()
+        self._area.setEditable(False)
+        self._area.setFont(Font("Monospaced", Font.PLAIN, 12))
+        self._panel = JPanel(BorderLayout())
+        self._panel.add(JScrollPane(self._area), BorderLayout.CENTER)
+        callbacks.addSuiteTab(self)
+        self._print("NBFS msbin1 (menu) loaded. NBFS.exe %s"
+                    % ("FOUND" if os.path.isfile(NBFS_EXE) else "MISSING at " + NBFS_EXE))
 
-    def createNewInstance(self, controller, editable):
-        # editable=False -> we present a read-only viewer, never mutate the message
-        return NBFSTab(self, controller)
-
-    def _log(self, msg):
-        self._stdout.write((msg + "\n").encode("utf-8"))
-
-
-class NBFSTab(IMessageEditorTab):
-
-    def __init__(self, extender, controller):
-        self._extender = extender
-        self._helpers = extender._helpers
-        self._txt = extender._callbacks.createTextEditor()
-        self._txt.setEditable(False)
-        self._current = None
-
+    # ITab
     def getTabCaption(self):
-        return "NBFS Decoded"
+        return "NBFS"
 
     def getUiComponent(self):
-        return self._txt.getComponent()
+        return self._panel
 
-    def isEnabled(self, content, isRequest):
-        if content is None:
-            return False
-        info = (self._helpers.analyzeRequest(content) if isRequest
-                else self._helpers.analyzeResponse(content))
-        for h in info.getHeaders():
-            hl = h.lower()
-            if hl.startswith("content-type:") and "msbin1" in hl:
-                return True
-        return False
+    # IContextMenuFactory
+    def createMenuItems(self, invocation):
+        self._inv = invocation
+        item = JMenuItem("Decode msbin1 (NBFS)", actionPerformed=self._on_click)
+        items = ArrayList()
+        items.add(item)
+        return items
 
-    def setMessage(self, content, isRequest):
-        self._current = content
-        if content is None:
-            self._txt.setText(None)
-            return
-        info = (self._helpers.analyzeRequest(content) if isRequest
-                else self._helpers.analyzeResponse(content))
-        body = Arrays.copyOfRange(content, info.getBodyOffset(), len(content))
-        if len(body) == 0:
-            self._txt.setText(self._helpers.stringToBytes("[empty body]"))
-            return
-        b64 = str(self._helpers.base64Encode(body))
+    def _on_click(self, event):
         try:
-            xml = self._decode(b64)
-        except Exception as e:
-            xml = "[decode error] %s" % e
-        self._txt.setText(self._helpers.stringToBytes(xml))
-
-    def getMessage(self):
-        return self._current          # read-only: hand back the original untouched
-
-    def isModified(self):
-        return False
-
-    def getSelectedData(self):
-        return self._txt.getSelectedText()
-
-    # --- decoding -----------------------------------------------------------
-
-    def _decode(self, b64input):
-        # NBFS.exe decode <base64>  ->  base64(UTF-8 XML) on stdout
-        p = subprocess.Popen(
-            [NBFS_EXE, "decode", b64input],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out, err = p.communicate()
-        out = (out or "").strip()
-        if not out:
-            return "[no output from NBFS.exe] %s" % (err or "")
-        try:
-            xml = base64.b64decode(out).decode("utf-8", "replace")
+            inv = self._inv
+            ctx = inv.getInvocationContext()
+            msgs = inv.getSelectedMessages()
+            if not msgs:
+                self._popup("NBFS", "[no message selected]")
+                return
+            chunks = []
+            for m in msgs:
+                chunks.append(self._decode_one(m, ctx))
+            text = ("\n\n" + "=" * 70 + "\n\n").join(chunks)
+            self._append(text)
+            self._popup("NBFS decoded", text)
         except Exception:
-            # NBFS.exe returns exceptions as base64 too; if that fails, show raw
-            return "[unexpected NBFS output] %s" % out
-        return self._pretty(xml)
+            self._popup("NBFS error", traceback.format_exc())
+
+    def _decode_one(self, m, ctx):
+        # ctx: 0/2 = request, 1/3 = response; else try response then request
+        try:
+            if ctx in (0, 2):
+                raw, isReq = m.getRequest(), True
+            elif ctx in (1, 3):
+                raw, isReq = m.getResponse(), False
+            else:
+                raw, isReq = (m.getResponse(), False) if m.getResponse() else (m.getRequest(), True)
+            if raw is None:
+                return "[no bytes for this message]"
+            info = (self._helpers.analyzeRequest(raw) if isReq
+                    else self._helpers.analyzeResponse(raw))
+            body = Arrays.copyOfRange(raw, info.getBodyOffset(), len(raw))
+            head = "[%s body %d bytes]" % ("REQUEST" if isReq else "RESPONSE", len(body))
+            return head + "\n\n" + self._nbfs_decode(body)
+        except Exception:
+            return "[decode_one error]\n" + traceback.format_exc()
+
+    def _nbfs_decode(self, body):
+        if body is None or len(body) == 0:
+            return "[empty body]"
+        if not os.path.isfile(NBFS_EXE):
+            return "[NBFS.exe not found at %s]" % NBFS_EXE
+        try:
+            b64 = self._helpers.base64Encode(body)   # java String
+            cmd = ArrayList()
+            cmd.add(NBFS_EXE); cmd.add("decode"); cmd.add(b64)
+            pb = ProcessBuilder(cmd)
+            proc = pb.start()
+            out = self._read(proc.getInputStream())
+            err = self._read(proc.getErrorStream())
+            proc.waitFor()
+            out = out.strip()
+            if not out:
+                return "[NBFS.exe returned nothing] " + err
+            xml = JString(self._helpers.base64Decode(out), "UTF-8")
+            if not xml.lstrip().startswith("<"):
+                return "[NBFS decode error] " + xml
+            return self._pretty(xml)
+        except Exception:
+            return "[nbfs_decode raised]\n" + traceback.format_exc()
+
+    def _read(self, stream):
+        br = BufferedReader(InputStreamReader(stream, "UTF-8"))
+        parts = []
+        line = br.readLine()
+        while line is not None:
+            parts.append(line)
+            line = br.readLine()
+        br.close()
+        return "".join(parts)   # base64 is one token; join without newlines
 
     def _pretty(self, xml):
         try:
             from xml.dom import minidom
-            pretty = minidom.parseString(xml.encode("utf-8")).toprettyxml(indent="  ")
-            # strip blank lines minidom loves to add
-            return "\n".join(l for l in pretty.splitlines() if l.strip())
+            p = minidom.parseString(JString(xml).getBytes("UTF-8")).toprettyxml(indent="  ")
+            return "\n".join(l for l in p.splitlines() if l.strip())
         except Exception:
-            return xml
+            return xml if isinstance(xml, (str, unicode)) else str(xml)
+
+    # ---- UI helpers --------------------------------------------------------
+
+    def _append(self, text):
+        area = self._area
+        class _R(Runnable):
+            def run(_s):
+                area.append(text + "\n\n" + ("#" * 70) + "\n\n")
+                area.setCaretPosition(area.getDocument().getLength())
+        SwingUtilities.invokeLater(_R())
+
+    def _popup(self, title, text):
+        class _R(Runnable):
+            def run(_s):
+                f = JFrame(title)
+                ta = JTextArea(text)
+                ta.setEditable(False)
+                ta.setFont(Font("Monospaced", Font.PLAIN, 12))
+                f.add(JScrollPane(ta))
+                f.setSize(Dimension(950, 720))
+                f.setLocationRelativeTo(None)
+                f.setVisible(True)
+        SwingUtilities.invokeLater(_R())
+
+    def _print(self, m):
+        try:
+            self._callbacks.printOutput(m)
+        except Exception:
+            pass
