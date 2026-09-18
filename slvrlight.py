@@ -1,22 +1,22 @@
 # -*- coding: utf-8 -*-
-# Burp (Jython): decode Silverlight/WCF bodies (application/x-zip zlib-compressed,
-# and application/soap+msbin1). Prints decoded bodies to the Extensions Output tab
-# via a PrintWriter (reliable), and also provides a message-editor tab.
+# Burp (Jython): decode AND edit Silverlight/WCF x-zip (zlib) / msbin1 requests.
+# - shows editable decoded XML in the "x-zip Edit" tab
+# - on Send/Forward, re-encodes: [msbin1 encode if needed] -> compress -> fix length
+# Works in Repeater and Proxy intercept (editable contexts). History is read-only.
 
 from burp import (IBurpExtender, IMessageEditorTabFactory, IMessageEditorTab,
                   IHttpListener)
 from java.util import Arrays
-from java.util.zip import Inflater, GZIPInputStream
-from java.io import (ByteArrayInputStream, ByteArrayOutputStream, PrintWriter)
+from java.util.zip import Inflater, GZIPInputStream, Deflater, GZIPOutputStream
+from java.io import ByteArrayInputStream, ByteArrayOutputStream, PrintWriter
+from java.lang import String as JString
 import jarray
 import subprocess
-import base64
 import os
 import traceback
 
-NBFS_EXE = r"C:\tools\wcf\NBFS.exe"
+NBFS_EXE = r"C:\tools\wcf\NBFS.exe"          # only needed if inner layer is msbin1
 TRIGGERS = ("x-zip", "x-gzip", "zip", "deflate", "msbin1")
-SAVE_DIR = None    # e.g. r"C:\tools\wcf\dumps" to also save decoded messages to files
 
 
 class BurpExtender(IBurpExtender, IMessageEditorTabFactory, IHttpListener):
@@ -24,171 +24,156 @@ class BurpExtender(IBurpExtender, IMessageEditorTabFactory, IHttpListener):
     def registerExtenderCallbacks(self, callbacks):
         self._callbacks = callbacks
         self._helpers = callbacks.getHelpers()
-        # PrintWriter with autoflush -- THIS is what makes Output actually print
         self._out = PrintWriter(callbacks.getStdout(), True)
-        self._err = PrintWriter(callbacks.getStderr(), True)
-        self._n = 0
-        callbacks.setExtensionName("WCF x-zip / NBFS Decoder")
+        callbacks.setExtensionName("WCF x-zip / msbin1 Editor")
         callbacks.registerMessageEditorTabFactory(self)
         callbacks.registerHttpListener(self)
-        self.log("=========================================================")
-        self.log(" WCF x-zip / NBFS Decoder loaded OK")
-        self.log(" NBFS.exe: %s" % ("present" if os.path.isfile(NBFS_EXE) else "absent (fine if bodies are XML)"))
-        self.log(" Watching content-types containing: %s" % ", ".join(TRIGGERS))
-        self.log(" NOTE: the listener only fires on NEW traffic through Burp.")
-        self.log("       Send a request in Repeater or reload the app to test.")
-        self.log("=========================================================")
+        self.log("=== WCF x-zip / msbin1 Editor loaded. NBFS=%s ===" %
+                 ("present" if os.path.isfile(NBFS_EXE) else "absent (ok if inner is XML)"))
 
     def log(self, m):
         try:
             self._out.println(m)
         except Exception:
-            try:
-                self._out.println(repr(m))
-            except Exception:
-                pass
+            pass
 
     def createNewInstance(self, controller, editable):
-        return WcfTab(self)
+        return WcfEditTab(self, editable)
 
-    # ---- HTTP listener: reliable output channel ---------------------------
-
-    def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
+    # visibility only: log decoded bodies of live traffic to Output
+    def processHttpMessage(self, toolFlag, isReq, mi):
         try:
-            if messageIsRequest:
-                raw = messageInfo.getRequest()
-                if raw is None:
-                    return
-                info = self._helpers.analyzeRequest(raw)
-                kind = "REQUEST"
-            else:
-                raw = messageInfo.getResponse()
-                if raw is None:
-                    return
-                info = self._helpers.analyzeResponse(raw)
-                kind = "RESPONSE"
-
-            ctype = self._content_type(info.getHeaders())
-            if not ctype or not any(t in ctype.lower() for t in TRIGGERS):
+            raw = mi.getRequest() if isReq else mi.getResponse()
+            if raw is None:
                 return
-
+            info = (self._helpers.analyzeRequest(raw) if isReq
+                    else self._helpers.analyzeResponse(raw))
+            ct = self._content_type(info.getHeaders())
+            if not ct or not any(t in ct.lower() for t in TRIGGERS):
+                return
             body = Arrays.copyOfRange(raw, info.getBodyOffset(), len(raw))
-            self._n += 1
-            url = ""
+            inner, how, kind, xml = self.decode(body)
+            self.log("\n---- %s (%s) [%s/%s] ----\n%s"
+                     % ("REQUEST" if isReq else "RESPONSE", ct, how, kind, xml))
+        except Exception:
+            self.log("[listener] " + traceback.format_exc())
+
+    # ===================== decode / encode core ============================
+
+    def decode(self, body):
+        """returns (inner_bytes, how, kind, display_text). kind in xml/msbin1/raw."""
+        if len(body) == 0:
+            return body, "none", "raw", "[empty body]"
+        inner, how = self._inflate(body)
+        if inner is None:
+            inner, how = body, "none"
+        if self._looks_xml(inner):
+            return inner, how, "xml", self._pretty(self._helpers.bytesToString(inner))
+        if os.path.isfile(NBFS_EXE):
+            xml = self._nbfs_decode(inner)
+            if xml is not None:
+                return inner, how, "msbin1", self._pretty(xml)
+        return inner, how, "raw", ("[cannot decode inner; how=%s first=%s]\n%s"
+                                   % (how, self._first(inner), self._hex(inner)))
+
+    def encode(self, xml_text, how, kind):
+        """reverse of decode: xml text -> wire body bytes (java byte[]) or None."""
+        if kind == "xml":
+            inner = JString(xml_text).getBytes("UTF-8")
+        elif kind == "msbin1":
+            inner = self._nbfs_encode(xml_text)
+            if inner is None:
+                return None
+        else:
+            return None
+        return self._compress(inner, how)
+
+    # ---- compression ------------------------------------------------------
+
+    def _inflate(self, data):
+        for nowrap, label in ((False, "zlib"), (True, "raw-deflate")):
             try:
-                url = str(self._helpers.analyzeRequest(messageInfo).getUrl())
+                inf = Inflater(nowrap); inf.setInput(data)
+                out = ByteArrayOutputStream(); buf = jarray.zeros(8192, 'b')
+                while not inf.finished():
+                    n = inf.inflate(buf)
+                    if n > 0:
+                        out.write(buf, 0, n)
+                    elif inf.finished() or inf.needsDictionary() or inf.needsInput():
+                        break
+                inf.end()
+                b = out.toByteArray()
+                if b and len(b) > 0:
+                    return b, label
             except Exception:
                 pass
-
-            decoded = self.decode_body(body)
-            self.log("\n================ #%d %s  (%s) ================"
-                     % (self._n, kind, ctype))
-            if url:
-                self.log(url)
-            self.log(decoded)
-
-            if SAVE_DIR:
-                self._save(decoded, kind)
-        except Exception:
-            self.log("[listener error]\n" + traceback.format_exc())
-
-    def _save(self, decoded, kind):
         try:
-            if not os.path.isdir(SAVE_DIR):
-                os.makedirs(SAVE_DIR)
-            fn = os.path.join(SAVE_DIR, "msg_%04d_%s.txt" % (self._n, kind.lower()))
-            f = open(fn, "wb")
-            f.write(decoded.encode("utf-8", "replace"))
-            f.close()
+            gz = GZIPInputStream(ByteArrayInputStream(data))
+            out = ByteArrayOutputStream(); buf = jarray.zeros(8192, 'b')
+            while True:
+                n = gz.read(buf)
+                if n < 0:
+                    break
+                out.write(buf, 0, n)
+            gz.close()
+            b = out.toByteArray()
+            if b and len(b) > 0:
+                return b, "gzip"
         except Exception:
-            self.log("[save failed]\n" + traceback.format_exc())
+            pass
+        return None, None
 
-    # ---- shared decode logic ----------------------------------------------
+    def _compress(self, data, how):
+        if how in (None, "none"):
+            return data
+        if how == "gzip":
+            bos = ByteArrayOutputStream()
+            g = GZIPOutputStream(bos); g.write(data); g.close()
+            return bos.toByteArray()
+        nowrap = (how == "raw-deflate")
+        d = Deflater(Deflater.DEFAULT_COMPRESSION, nowrap)
+        d.setInput(data); d.finish()
+        bos = ByteArrayOutputStream(); buf = jarray.zeros(8192, 'b')
+        while not d.finished():
+            n = d.deflate(buf)
+            if n > 0:
+                bos.write(buf, 0, n)
+        d.end()
+        return bos.toByteArray()
 
-    def decode_body(self, body):
-        out = []
-        out.append("[body %d bytes]  first: %s" % (len(body), self._first_bytes(body)))
-        if len(body) == 0:
-            return "\n".join(out + ["[empty body]"])
+    # ---- msbin1 via NBFS.exe (stays in java byte[] via helpers.base64*) ----
 
-        inner, how = None, None
-        try:
-            inner, how = self._inflate(body)
-        except Exception:
-            out.append("[inflate raised]\n" + traceback.format_exc())
-        if inner is None:
-            inner, how = body, "not-compressed"
-        out.append("[stage: %s]  inner %d bytes  first: %s"
-                   % (how, len(inner), self._first_bytes(inner)))
-        out.append("")
+    def _nbfs_decode(self, data):
+        b64 = self._helpers.base64Encode(data)
+        p = subprocess.Popen([NBFS_EXE, "decode", str(b64)],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        so, se = p.communicate()
+        so = (so or "").strip()
+        if not so:
+            return None
+        xml_bytes = self._helpers.base64Decode(so)
+        s = JString(xml_bytes, "UTF-8")
+        return s if s.lstrip().startswith("<") else None
 
-        try:
-            if self._looks_xml(inner):
-                out.append(self._pretty_xml(inner))
-                return "\n".join(out)
-        except Exception:
-            out.append("[xml stage raised]\n" + traceback.format_exc())
+    def _nbfs_encode(self, xml_text):
+        raw = JString(xml_text).getBytes("UTF-8")
+        b64 = self._helpers.base64Encode(raw)
+        p = subprocess.Popen([NBFS_EXE, "encode", str(b64)],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        so, se = p.communicate()
+        so = (so or "").strip()
+        if not so:
+            self.log("[nbfs encode: no output] " + (se or ""))
+            return None
+        return self._helpers.base64Decode(so)   # java byte[] msbin1
 
-        if os.path.isfile(NBFS_EXE):
-            try:
-                xml = self._nbfs(inner)
-                if xml is not None:
-                    out.append(xml)
-                    return "\n".join(out)
-            except Exception:
-                out.append("[nbfs stage raised]\n" + traceback.format_exc())
-
-        out.append("[inner not XML / no msbin1 decode -- hex dump]")
-        out.append(self._hex(inner))
-        return "\n".join(out)
+    # ---- helpers ----------------------------------------------------------
 
     def _content_type(self, headers):
         for h in headers:
             if h.lower().startswith("content-type:"):
                 return h.split(":", 1)[1].strip()
         return None
-
-    def _inflate(self, data):
-        for nowrap, label in ((False, "zlib"), (True, "raw-deflate")):
-            try:
-                o = self._run_inflater(data, nowrap)
-                if o and len(o) > 0:
-                    return o, label
-            except Exception:
-                pass
-        try:
-            o = self._gunzip(data)
-            if o and len(o) > 0:
-                return o, "gzip"
-        except Exception:
-            pass
-        return None, None
-
-    def _run_inflater(self, data, nowrap):
-        inf = Inflater(nowrap)
-        inf.setInput(data)
-        out = ByteArrayOutputStream()
-        buf = jarray.zeros(8192, 'b')
-        while not inf.finished():
-            n = inf.inflate(buf)
-            if n > 0:
-                out.write(buf, 0, n)
-            elif inf.finished() or inf.needsDictionary() or inf.needsInput():
-                break
-        inf.end()
-        return out.toByteArray()
-
-    def _gunzip(self, data):
-        gz = GZIPInputStream(ByteArrayInputStream(data))
-        out = ByteArrayOutputStream()
-        buf = jarray.zeros(8192, 'b')
-        while True:
-            n = gz.read(buf)
-            if n < 0:
-                break
-            out.write(buf, 0, n)
-        gz.close()
-        return out.toByteArray()
 
     def _looks_xml(self, data):
         i = 0
@@ -199,38 +184,21 @@ class BurpExtender(IBurpExtender, IMessageEditorTabFactory, IHttpListener):
             i += 1
         return i < len(data) and (data[i] & 0xFF) == 0x3C
 
-    def _pretty_xml(self, data):
-        s = self._helpers.bytesToString(data)
+    def _pretty(self, s):
         try:
             from xml.dom import minidom
-            p = minidom.parseString(s.encode("utf-8")).toprettyxml(indent="  ")
+            p = minidom.parseString(JString(s).getBytes("UTF-8")).toprettyxml(indent="  ")
             return "\n".join(l for l in p.splitlines() if l.strip())
         except Exception:
-            return s
+            return s if isinstance(s, (str, unicode)) else str(s)
 
-    def _nbfs(self, data):
-        b64 = str(self._helpers.base64Encode(data))
-        p = subprocess.Popen([NBFS_EXE, "decode", b64],
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        so, se = p.communicate()
-        so = (so or "").strip()
-        if not so:
-            return None
-        xml = base64.b64decode(so).decode("utf-8", "replace")
-        if xml.lstrip().startswith("<"):
-            return self._pretty_xml(self._helpers.stringToBytes(xml))
-        return None
-
-    def _first_bytes(self, data, n=8):
+    def _first(self, data, n=8):
         return " ".join("%02X" % (data[i] & 0xFF) for i in range(min(n, len(data))))
 
-    def _hex(self, data, width=16, maxlen=8192):
-        rows = []
-        end = min(len(data), maxlen)
-        off = 0
+    def _hex(self, data, width=16, maxlen=4096):
+        rows = []; end = min(len(data), maxlen); off = 0
         while off < end:
-            hexp, asc = [], []
-            j = off
+            hexp, asc = [], []; j = off
             while j < off + width and j < end:
                 v = data[j] & 0xFF
                 hexp.append("%02X" % v)
@@ -238,21 +206,23 @@ class BurpExtender(IBurpExtender, IMessageEditorTabFactory, IHttpListener):
                 j += 1
             rows.append("%08X  %-48s  %s" % (off, " ".join(hexp), "".join(asc)))
             off += width
-        if len(data) > maxlen:
-            rows.append("... (%d more bytes)" % (len(data) - maxlen))
         return "\n".join(rows)
 
 
-class WcfTab(IMessageEditorTab):
-    def __init__(self, extender):
+class WcfEditTab(IMessageEditorTab):
+    def __init__(self, extender, editable):
         self._x = extender
         self._helpers = extender._helpers
+        self._editable = editable
         self._txt = extender._callbacks.createTextEditor()
-        self._txt.setEditable(False)
+        self._txt.setEditable(editable)
         self._current = None
+        self._isReq = True
+        self._how = "none"
+        self._kind = "raw"
 
     def getTabCaption(self):
-        return "x-zip Decoded"
+        return "x-zip Edit"
 
     def getUiComponent(self):
         return self._txt.getComponent()
@@ -269,9 +239,8 @@ class WcfTab(IMessageEditorTab):
             return False
 
     def setMessage(self, content, isRequest):
-        self._x.log("[tab] setMessage fired isRequest=%s len=%s"
-                    % (isRequest, "None" if content is None else len(content)))
         self._current = content
+        self._isReq = isRequest
         if content is None:
             self._txt.setText(None)
             return
@@ -279,21 +248,34 @@ class WcfTab(IMessageEditorTab):
             info = (self._helpers.analyzeRequest(content) if isRequest
                     else self._helpers.analyzeResponse(content))
             body = Arrays.copyOfRange(content, info.getBodyOffset(), len(content))
-            text = self._x.decode_body(body)
+            inner, how, kind, xml = self._x.decode(body)
+            self._how, self._kind = how, kind
+            # only allow editing when we can faithfully re-encode
+            self._txt.setEditable(self._editable and kind in ("xml", "msbin1"))
+            self._txt.setText(JString(xml).getBytes("UTF-8"))
         except Exception:
-            text = "[tab crashed]\n\n" + traceback.format_exc()
-        if not text:
-            text = "[no text produced]"
-        try:
-            self._txt.setText(self._helpers.stringToBytes(text))
-        except Exception:
-            self._x.log("[tab setText failed]\n" + traceback.format_exc())
-
-    def getMessage(self):
-        return self._current
+            self._txt.setEditable(False)
+            self._txt.setText(JString("[decode failed]\n" + traceback.format_exc()).getBytes("UTF-8"))
 
     def isModified(self):
-        return False
+        return self._txt.isTextModified()
+
+    def getMessage(self):
+        try:
+            if (not self._editable or self._current is None
+                    or self._kind not in ("xml", "msbin1")
+                    or not self._txt.isTextModified()):
+                return self._current
+            text = JString(self._txt.getText(), "UTF-8")
+            body = self._x.encode(text, self._how, self._kind)
+            if body is None:
+                return self._current
+            info = (self._helpers.analyzeRequest(self._current) if self._isReq
+                    else self._helpers.analyzeResponse(self._current))
+            return self._helpers.buildHttpMessage(info.getHeaders(), body)
+        except Exception:
+            self._x.log("[getMessage] " + traceback.format_exc())
+            return self._current
 
     def getSelectedData(self):
         return self._txt.getSelectedText()
