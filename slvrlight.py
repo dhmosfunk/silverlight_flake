@@ -43,6 +43,11 @@ from java.lang import ProcessBuilder, StringBuilder
 from java.lang import String as JString
 from java.io import BufferedReader, InputStreamReader, ByteArrayInputStream, ByteArrayOutputStream
 from java.util.zip import GZIPInputStream, GZIPOutputStream, Inflater, Deflater
+from javax.xml.parsers import DocumentBuilderFactory
+from javax.xml.transform import TransformerFactory, OutputKeys
+from javax.xml.transform.dom import DOMSource
+from javax.xml.transform.stream import StreamResult
+from org.w3c.dom import Node
 import jarray
 import os
 
@@ -64,6 +69,14 @@ ENABLE_ON_TYPES = [
 ]
 
 TAB_CAPTION = "WCF (msbin1)"
+
+# Pretty-print the decoded XML for display, and reformat it cleanly on the way
+# back out. This also fixes non-ASCII text (e.g. Greek): on re-encode the XML
+# is emitted as US-ASCII with numeric character references, so NBFS.exe (which
+# treats input as ASCII) can't mangle it. Set to False to see/send NBFS's raw
+# single-line output untouched.
+PRETTY_PRINT = True
+INDENT_AMOUNT = 2
 # ===========================================================================
 
 
@@ -208,6 +221,10 @@ def decode_to_xml_bytes(msbin_bytes):
     while i < n and (out[i] & 0xFF) in skip:
         i += 1
     if i < n and (out[i] & 0xFF) == 0x3C:        # '<'  -> looks like XML
+        if PRETTY_PRINT:
+            ok, pretty = format_xml(out, True, "UTF-8")
+            if ok:
+                return (True, pretty)
         return (True, out)
     # NBFS reports its own errors as base64-wrapped text.
     return (False, str_to_jbytes("[NBFS decode error]\n\n" + str(jbytes_to_str(out))))
@@ -232,6 +249,76 @@ def strip_content_length(headers):
         if not h.lower().startswith("content-length:"):
             out.add(h)
     return out
+
+
+# --------------------------- XML pretty / compact --------------------------
+def _parse_xml(xml_bytes):
+    dbf = DocumentBuilderFactory.newInstance()
+    dbf.setNamespaceAware(True)
+    for feat, val in (
+        ("http://apache.org/xml/features/nonvalidating/load-external-dtd", False),
+        ("http://xml.org/sax/features/external-general-entities", False),
+        ("http://xml.org/sax/features/external-parameter-entities", False),
+    ):
+        try:
+            dbf.setFeature(feat, val)
+        except Exception:
+            pass
+    db = dbf.newDocumentBuilder()
+    return db.parse(ByteArrayInputStream(xml_bytes))
+
+
+def _strip_indent_ws(node):
+    # Remove whitespace-only text nodes, but ONLY inside element containers
+    # (real indentation). Leaf text values are left exactly as-is, so nothing
+    # meaningful gets altered when we re-serialize.
+    kids = node.getChildNodes()
+    items = [kids.item(i) for i in range(kids.getLength())]
+    has_elem = any(c.getNodeType() == Node.ELEMENT_NODE for c in items)
+    for c in items:
+        t = c.getNodeType()
+        if t == Node.TEXT_NODE and has_elem:
+            v = c.getNodeValue()
+            if v is None or v.strip() == "":
+                node.removeChild(c)
+        elif t == Node.ELEMENT_NODE:
+            _strip_indent_ws(c)
+
+
+def _serialize_xml(doc, indent, omit_decl, encoding):
+    t = TransformerFactory.newInstance().newTransformer()
+    t.setOutputProperty(OutputKeys.OMIT_XML_DECLARATION, "yes" if omit_decl else "no")
+    t.setOutputProperty(OutputKeys.ENCODING, encoding)
+    t.setOutputProperty(OutputKeys.INDENT, "yes" if indent else "no")
+    if indent:
+        try:
+            t.setOutputProperty("{http://xml.apache.org/xslt}indent-amount", str(INDENT_AMOUNT))
+        except Exception:
+            pass
+    bos = ByteArrayOutputStream()
+    t.transform(DOMSource(doc), StreamResult(bos))
+    return bos.toByteArray()
+
+
+def format_xml(xml_bytes, indent, encoding):
+    """Reformat XML. indent=True -> pretty (display); indent=False -> compact
+    (for re-encoding). Returns (ok, byte[]); (False, original) if unparseable."""
+    try:
+        text = str(jbytes_to_str(xml_bytes)).lstrip()
+    except Exception:
+        text = ""
+    omit_decl = not text.startswith("<?xml")
+    try:
+        doc = _parse_xml(xml_bytes)
+    except Exception:
+        return (False, xml_bytes)
+    root = doc.getDocumentElement()
+    if root is not None:
+        _strip_indent_ws(root)
+    try:
+        return (True, _serialize_xml(doc, indent, omit_decl, encoding))
+    except Exception:
+        return (False, xml_bytes)
 
 
 # ---------------------------- the editor tab -------------------------------
@@ -315,6 +402,12 @@ class WCFTab(IMessageEditorTab):
             return self._current
         try:
             xmlbytes = self._txt.getText()             # java byte[]
+            if PRETTY_PRINT:
+                # Strip the display indentation and emit ASCII (numeric refs for
+                # non-ASCII) so NBFS re-encodes exactly what you meant.
+                ok, compact = format_xml(xmlbytes, False, "US-ASCII")
+                if ok:
+                    xmlbytes = compact
             status, encoded = run_nbfs(OP_ENCODE, xmlbytes)
             if status == "err" or looks_like_nbfs_error(encoded):
                 # Could not re-encode (e.g. malformed XML): leave message untouched.
