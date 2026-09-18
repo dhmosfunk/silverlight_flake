@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
-# Burp (Jython) extension: decode Silverlight/WCF application/x-zip bodies
-# (zlib/deflate-compressed SOAP), with defensive error reporting so the tab
-# never comes back silently empty.
+# Burp (Jython): decode Silverlight/WCF bodies (application/x-zip zlib-compressed,
+# and application/soap+msbin1). Two output channels:
+#   1) HTTP listener -> prints decoded bodies to the extension Output tab (robust)
+#   2) message editor tab "x-zip Decoded" (with logging so we can see it fire)
 
-from burp import IBurpExtender, IMessageEditorTabFactory, IMessageEditorTab
+from burp import (IBurpExtender, IMessageEditorTabFactory, IMessageEditorTab,
+                  IHttpListener)
 from java.util import Arrays
 from java.util.zip import Inflater, GZIPInputStream
 from java.io import ByteArrayInputStream, ByteArrayOutputStream
@@ -15,84 +17,82 @@ import traceback
 
 NBFS_EXE = r"C:\tools\wcf\NBFS.exe"
 TRIGGERS = ("x-zip", "x-gzip", "zip", "deflate", "msbin1")
+LOG_TO_OUTPUT = True          # print decoded bodies to Extensions -> Output
+SAVE_DIR = None               # e.g. r"C:\tools\wcf\dumps" to also save to files
 
 
-class BurpExtender(IBurpExtender, IMessageEditorTabFactory):
+class BurpExtender(IBurpExtender, IMessageEditorTabFactory, IHttpListener):
+
     def registerExtenderCallbacks(self, callbacks):
         self._callbacks = callbacks
         self._helpers = callbacks.getHelpers()
         self._stdout = callbacks.getStdout()
+        self._n = 0
         callbacks.setExtensionName("WCF x-zip / NBFS Decoder")
         callbacks.registerMessageEditorTabFactory(self)
-        self._log("loaded ok. NBFS=%s" % ("present" if os.path.isfile(NBFS_EXE) else "absent"))
+        callbacks.registerHttpListener(self)
+        self.log("=== loaded. listener + tab active. NBFS=%s ===" %
+                 ("present" if os.path.isfile(NBFS_EXE) else "absent"))
 
-    def createNewInstance(self, controller, editable):
-        return WcfTab(self)
-
-    def _log(self, m):
+    def log(self, m):
+        if not LOG_TO_OUTPUT:
+            return
         try:
             self._stdout.write((m + "\n").encode("utf-8"))
         except Exception:
             pass
 
+    def createNewInstance(self, controller, editable):
+        return WcfTab(self)
 
-class WcfTab(IMessageEditorTab):
-    def __init__(self, extender):
-        self._x = extender
-        self._helpers = extender._helpers
-        self._txt = extender._callbacks.createTextEditor()
-        self._txt.setEditable(False)
-        self._current = None
+    # ---- HTTP listener: the reliable path ---------------------------------
 
-    def getTabCaption(self):
-        return "x-zip Decoded"
-
-    def getUiComponent(self):
-        return self._txt.getComponent()
-
-    def isEnabled(self, content, isRequest):
-        if content is None:
-            return False
+    def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
         try:
-            info = (self._helpers.analyzeRequest(content) if isRequest
-                    else self._helpers.analyzeResponse(content))
-            for h in info.getHeaders():
-                hl = h.lower()
-                if hl.startswith("content-type:") and any(t in hl for t in TRIGGERS):
-                    return True
+            if messageIsRequest:
+                raw = messageInfo.getRequest()
+                info = self._helpers.analyzeRequest(raw)
+                kind = "REQUEST"
+            else:
+                raw = messageInfo.getResponse()
+                if raw is None:
+                    return
+                info = self._helpers.analyzeResponse(raw)
+                kind = "RESPONSE"
+
+            ctype = self._content_type(info.getHeaders())
+            if not ctype or not any(t in ctype.lower() for t in TRIGGERS):
+                return
+
+            body = Arrays.copyOfRange(raw, info.getBodyOffset(), len(raw))
+            self._n += 1
+            url = ""
+            try:
+                url = str(self._helpers.analyzeRequest(messageInfo).getUrl())
+            except Exception:
+                pass
+
+            decoded = self.decode_body(body)
+            banner = ("\n================ #%d %s  (%s) ================\n%s\n%s"
+                      % (self._n, kind, ctype, url, decoded))
+            self.log(banner)
+
+            if SAVE_DIR:
+                try:
+                    if not os.path.isdir(SAVE_DIR):
+                        os.makedirs(SAVE_DIR)
+                    fn = os.path.join(SAVE_DIR, "msg_%04d_%s.xml" % (self._n, kind.lower()))
+                    f = open(fn, "wb")
+                    f.write(decoded.encode("utf-8", "replace"))
+                    f.close()
+                except Exception:
+                    self.log("[save failed]\n" + traceback.format_exc())
         except Exception:
-            return False
-        return False
+            self.log("[listener error]\n" + traceback.format_exc())
 
-    def setMessage(self, content, isRequest):
-        self._current = content
-        if content is None:
-            self._txt.setText(None)
-            return
-        try:
-            info = (self._helpers.analyzeRequest(content) if isRequest
-                    else self._helpers.analyzeResponse(content))
-            body = Arrays.copyOfRange(content, info.getBodyOffset(), len(content))
-            text = self._render(body)
-        except Exception:
-            text = "[extension crashed in setMessage]\n\n" + traceback.format_exc()
-        if not text:
-            text = "[render produced no text]"
-        self._x._log(text)  # also echo to the extension output tab
-        self._txt.setText(self._helpers.stringToBytes(text))
+    # ---- shared decode logic ----------------------------------------------
 
-    def getMessage(self):
-        return self._current
-
-    def isModified(self):
-        return False
-
-    def getSelectedData(self):
-        return self._txt.getSelectedText()
-
-    # ---- decode chain, each stage guarded ---------------------------------
-
-    def _render(self, body):
+    def decode_body(self, body):
         out = []
         out.append("[body %d bytes]  first: %s" % (len(body), self._first_bytes(body)))
         if len(body) == 0:
@@ -103,11 +103,10 @@ class WcfTab(IMessageEditorTab):
             inner, how = self._inflate(body)
         except Exception:
             out.append("[inflate raised]\n" + traceback.format_exc())
-
         if inner is None:
             inner, how = body, "not-compressed"
-        out.append("[stage: %s]  inner %d bytes  first: %s" %
-                   (how, len(inner), self._first_bytes(inner)))
+        out.append("[stage: %s]  inner %d bytes  first: %s"
+                   % (how, len(inner), self._first_bytes(inner)))
         out.append("")
 
         try:
@@ -129,6 +128,12 @@ class WcfTab(IMessageEditorTab):
         out.append("[inner not XML / no msbin1 decode -- hex dump]")
         out.append(self._hex(inner))
         return "\n".join(out)
+
+    def _content_type(self, headers):
+        for h in headers:
+            if h.lower().startswith("content-type:"):
+                return h.split(":", 1)[1].strip()
+        return None
 
     def _inflate(self, data):
         for nowrap, label in ((False, "zlib"), (True, "raw-deflate")):
@@ -171,8 +176,6 @@ class WcfTab(IMessageEditorTab):
             out.write(buf, 0, n)
         gz.close()
         return out.toByteArray()
-
-    # ---- helpers (no java-array slicing) ----------------------------------
 
     def _looks_xml(self, data):
         i = 0
@@ -225,3 +228,59 @@ class WcfTab(IMessageEditorTab):
         if len(data) > maxlen:
             rows.append("... (%d more bytes)" % (len(data) - maxlen))
         return "\n".join(rows)
+
+
+class WcfTab(IMessageEditorTab):
+    def __init__(self, extender):
+        self._x = extender
+        self._helpers = extender._helpers
+        self._txt = extender._callbacks.createTextEditor()
+        self._txt.setEditable(False)
+        self._current = None
+
+    def getTabCaption(self):
+        return "x-zip Decoded"
+
+    def getUiComponent(self):
+        return self._txt.getComponent()
+
+    def isEnabled(self, content, isRequest):
+        if content is None:
+            return False
+        try:
+            info = (self._helpers.analyzeRequest(content) if isRequest
+                    else self._helpers.analyzeResponse(content))
+            ct = self._x._content_type(info.getHeaders())
+            return bool(ct and any(t in ct.lower() for t in TRIGGERS))
+        except Exception:
+            return False
+
+    def setMessage(self, content, isRequest):
+        self._x.log("[tab] setMessage fired isRequest=%s len=%s"
+                    % (isRequest, "None" if content is None else len(content)))
+        self._current = content
+        if content is None:
+            self._txt.setText(None)
+            return
+        try:
+            info = (self._helpers.analyzeRequest(content) if isRequest
+                    else self._helpers.analyzeResponse(content))
+            body = Arrays.copyOfRange(content, info.getBodyOffset(), len(content))
+            text = self._x.decode_body(body)
+        except Exception:
+            text = "[tab crashed]\n\n" + traceback.format_exc()
+        if not text:
+            text = "[no text produced]"
+        try:
+            self._txt.setText(self._helpers.stringToBytes(text))
+        except Exception:
+            self._x.log("[tab setText failed]\n" + traceback.format_exc())
+
+    def getMessage(self):
+        return self._current
+
+    def isModified(self):
+        return False
+
+    def getSelectedData(self):
+        return self._txt.getSelectedText()
