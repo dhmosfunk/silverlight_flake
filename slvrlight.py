@@ -43,13 +43,30 @@ from java.lang import ProcessBuilder, StringBuilder
 from java.lang import String as JString
 from java.io import BufferedReader, InputStreamReader, ByteArrayInputStream, ByteArrayOutputStream
 from java.util.zip import GZIPInputStream, GZIPOutputStream, Inflater, Deflater
-from javax.xml.parsers import DocumentBuilderFactory
-from javax.xml.transform import TransformerFactory, OutputKeys
-from javax.xml.transform.dom import DOMSource
-from javax.xml.transform.stream import StreamResult
-from org.w3c.dom import Node
 import jarray
 import os
+import sys
+import traceback
+
+# XML pretty-printing libs are optional: if for any reason they can't be
+# imported, the extension still loads and just shows NBFS's raw output.
+try:
+    from javax.xml.parsers import DocumentBuilderFactory
+    from javax.xml.transform import TransformerFactory, OutputKeys
+    from javax.xml.transform.dom import DOMSource
+    from javax.xml.transform.stream import StreamResult
+    from org.w3c.dom import Node
+    _XML_OK = True
+except Exception:
+    _XML_OK = False
+
+
+def _log_err(prefix, e):
+    try:
+        sys.stderr.write("[WCF] %s: %s\n" % (prefix, str(e)))
+        traceback.print_exc()
+    except Exception:
+        pass
 
 # ============================ CONFIG =======================================
 NBFS_PATH = r"C:\Tools\NBFS.exe"          # <-- EDIT THIS to your NBFS.exe path
@@ -223,9 +240,11 @@ def decode_to_xml_bytes(msbin_bytes):
     if i < n and (out[i] & 0xFF) == 0x3C:        # '<'  -> looks like XML
         if PRETTY_PRINT:
             ok, pretty = format_xml(out, True, "UTF-8")
-            if ok:
+            if ok and pretty is not None and len(pretty) > 0:
                 return (True, pretty)
         return (True, out)
+    if n == 0:
+        return (False, str_to_jbytes("[NBFS returned empty output - check NBFS_PATH / self-test]"))
     # NBFS reports its own errors as base64-wrapped text.
     return (False, str_to_jbytes("[NBFS decode error]\n\n" + str(jbytes_to_str(out))))
 
@@ -302,7 +321,11 @@ def _serialize_xml(doc, indent, omit_decl, encoding):
 
 def format_xml(xml_bytes, indent, encoding):
     """Reformat XML. indent=True -> pretty (display); indent=False -> compact
-    (for re-encoding). Returns (ok, byte[]); (False, original) if unparseable."""
+    (for re-encoding). Returns (ok, byte[]). On ANY problem it returns
+    (False, original) so the caller falls back to the raw bytes - formatting
+    can never blank out or break the tab."""
+    if not _XML_OK:
+        return (False, xml_bytes)
     try:
         text = str(jbytes_to_str(xml_bytes)).lstrip()
     except Exception:
@@ -310,14 +333,15 @@ def format_xml(xml_bytes, indent, encoding):
     omit_decl = not text.startswith("<?xml")
     try:
         doc = _parse_xml(xml_bytes)
-    except Exception:
-        return (False, xml_bytes)
-    root = doc.getDocumentElement()
-    if root is not None:
-        _strip_indent_ws(root)
-    try:
-        return (True, _serialize_xml(doc, indent, omit_decl, encoding))
-    except Exception:
+        root = doc.getDocumentElement()
+        if root is not None:
+            _strip_indent_ws(root)
+        out = _serialize_xml(doc, indent, omit_decl, encoding)
+        if out is None or len(out) == 0:
+            return (False, xml_bytes)
+        return (True, out)
+    except Exception as e:
+        _log_err("format_xml failed (using raw output instead)", e)
         return (False, xml_bytes)
 
 
@@ -391,6 +415,7 @@ class WCFTab(IMessageEditorTab):
             self._txt.setText(xmlbytes)
             self._txt.setEditable(self._editable and ok)
         except Exception as e:
+            _log_err("setMessage failed", e)
             self._decoded_ok = False
             self._txt.setText(str_to_jbytes("[WCF tab error] " + str(e)))
             self._txt.setEditable(False)
@@ -436,6 +461,8 @@ class BurpExtender(IBurpExtender, IMessageEditorTabFactory):
 
         print("=== WCF Binary SOAP (msbin1) Editor loaded ===")
         print("NBFS invocation :", NBFS_INVOCATION)
+        print("Pretty-print    :", "on" if (PRETTY_PRINT and _XML_OK) else "off",
+              "(_XML_OK=%s)" % _XML_OK)
         try:
             exists = os.path.isfile(NBFS_PATH)
         except Exception:
