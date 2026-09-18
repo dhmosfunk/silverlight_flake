@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 # Burp (Jython): decode Silverlight/WCF bodies (application/x-zip zlib-compressed,
-# and application/soap+msbin1). Two output channels:
-#   1) HTTP listener -> prints decoded bodies to the extension Output tab (robust)
-#   2) message editor tab "x-zip Decoded" (with logging so we can see it fire)
+# and application/soap+msbin1). Prints decoded bodies to the Extensions Output tab
+# via a PrintWriter (reliable), and also provides a message-editor tab.
 
 from burp import (IBurpExtender, IMessageEditorTabFactory, IMessageEditorTab,
                   IHttpListener)
 from java.util import Arrays
 from java.util.zip import Inflater, GZIPInputStream
-from java.io import ByteArrayInputStream, ByteArrayOutputStream
+from java.io import (ByteArrayInputStream, ByteArrayOutputStream, PrintWriter)
 import jarray
 import subprocess
 import base64
@@ -17,8 +16,7 @@ import traceback
 
 NBFS_EXE = r"C:\tools\wcf\NBFS.exe"
 TRIGGERS = ("x-zip", "x-gzip", "zip", "deflate", "msbin1")
-LOG_TO_OUTPUT = True          # print decoded bodies to Extensions -> Output
-SAVE_DIR = None               # e.g. r"C:\tools\wcf\dumps" to also save to files
+SAVE_DIR = None    # e.g. r"C:\tools\wcf\dumps" to also save decoded messages to files
 
 
 class BurpExtender(IBurpExtender, IMessageEditorTabFactory, IHttpListener):
@@ -26,31 +24,41 @@ class BurpExtender(IBurpExtender, IMessageEditorTabFactory, IHttpListener):
     def registerExtenderCallbacks(self, callbacks):
         self._callbacks = callbacks
         self._helpers = callbacks.getHelpers()
-        self._stdout = callbacks.getStdout()
+        # PrintWriter with autoflush -- THIS is what makes Output actually print
+        self._out = PrintWriter(callbacks.getStdout(), True)
+        self._err = PrintWriter(callbacks.getStderr(), True)
         self._n = 0
         callbacks.setExtensionName("WCF x-zip / NBFS Decoder")
         callbacks.registerMessageEditorTabFactory(self)
         callbacks.registerHttpListener(self)
-        self.log("=== loaded. listener + tab active. NBFS=%s ===" %
-                 ("present" if os.path.isfile(NBFS_EXE) else "absent"))
+        self.log("=========================================================")
+        self.log(" WCF x-zip / NBFS Decoder loaded OK")
+        self.log(" NBFS.exe: %s" % ("present" if os.path.isfile(NBFS_EXE) else "absent (fine if bodies are XML)"))
+        self.log(" Watching content-types containing: %s" % ", ".join(TRIGGERS))
+        self.log(" NOTE: the listener only fires on NEW traffic through Burp.")
+        self.log("       Send a request in Repeater or reload the app to test.")
+        self.log("=========================================================")
 
     def log(self, m):
-        if not LOG_TO_OUTPUT:
-            return
         try:
-            self._stdout.write((m + "\n").encode("utf-8"))
+            self._out.println(m)
         except Exception:
-            pass
+            try:
+                self._out.println(repr(m))
+            except Exception:
+                pass
 
     def createNewInstance(self, controller, editable):
         return WcfTab(self)
 
-    # ---- HTTP listener: the reliable path ---------------------------------
+    # ---- HTTP listener: reliable output channel ---------------------------
 
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
         try:
             if messageIsRequest:
                 raw = messageInfo.getRequest()
+                if raw is None:
+                    return
                 info = self._helpers.analyzeRequest(raw)
                 kind = "REQUEST"
             else:
@@ -73,22 +81,27 @@ class BurpExtender(IBurpExtender, IMessageEditorTabFactory, IHttpListener):
                 pass
 
             decoded = self.decode_body(body)
-            banner = ("\n================ #%d %s  (%s) ================\n%s\n%s"
-                      % (self._n, kind, ctype, url, decoded))
-            self.log(banner)
+            self.log("\n================ #%d %s  (%s) ================"
+                     % (self._n, kind, ctype))
+            if url:
+                self.log(url)
+            self.log(decoded)
 
             if SAVE_DIR:
-                try:
-                    if not os.path.isdir(SAVE_DIR):
-                        os.makedirs(SAVE_DIR)
-                    fn = os.path.join(SAVE_DIR, "msg_%04d_%s.xml" % (self._n, kind.lower()))
-                    f = open(fn, "wb")
-                    f.write(decoded.encode("utf-8", "replace"))
-                    f.close()
-                except Exception:
-                    self.log("[save failed]\n" + traceback.format_exc())
+                self._save(decoded, kind)
         except Exception:
             self.log("[listener error]\n" + traceback.format_exc())
+
+    def _save(self, decoded, kind):
+        try:
+            if not os.path.isdir(SAVE_DIR):
+                os.makedirs(SAVE_DIR)
+            fn = os.path.join(SAVE_DIR, "msg_%04d_%s.txt" % (self._n, kind.lower()))
+            f = open(fn, "wb")
+            f.write(decoded.encode("utf-8", "replace"))
+            f.close()
+        except Exception:
+            self.log("[save failed]\n" + traceback.format_exc())
 
     # ---- shared decode logic ----------------------------------------------
 
